@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Recordings output
+recordings/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Environment
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+.claude/settings.local.json

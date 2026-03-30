@@ -1,0 +1,522 @@
+{
+  "test_timestamp": "2026-03-13T18:28:41",
+  "num_devices_found": 4,
+  "num_devices_tested": 4,
+  "poe_bandwidth_gbps": 2.5,
+  "usable_bandwidth_mbps": 2000.0,
+  "frame_sizes": {
+    "4k_30": 3021280,
+    "4k_50": 3021176,
+    "4k_70": 3013107,
+    "4k_85": 3010357,
+    "4k_100": 3007462,
+    "1080p_30": 637865,
+    "1080p_50": 637892,
+    "1080p_70": 639881,
+    "1080p_85": 646593,
+    "1080p_100": 643206,
+    "720p_30": 288635,
+    "720p_50": 275676,
+    "720p_70": 286482,
+    "720p_85": 293115,
+    "720p_100": 294413,
+    "480p_30": 116757,
+    "480p_50": 117736,
+    "480p_70": 116699,
+    "480p_85": 116378,
+    "480p_100": 116339
+  },
+  "detailed_results": [
+    {
+      "resolution": "4k",
+      "quality": 30,
+      "avg_frame_bytes": 3021280,
+      "min_frame_bytes": 2470504,
+      "max_frame_bytes": 3139881,
+      "stddev_bytes": 216600,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 725.11,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 41,
+      "max_fps_3cam": 27,
+      "max_fps_4cam": 20
+    },
+    {
+      "resolution": "4k",
+      "quality": 50,
+      "avg_frame_bytes": 3021176,
+      "min_frame_bytes": 2513910,
+      "max_frame_bytes": 3142007,
+      "stddev_bytes": 211509,
+      "frames_collected": 89,
+      "actual_fps": 28.5,
+      "per_camera_mbps_at_30fps": 725.08,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 41,
+      "max_fps_3cam": 27,
+      "max_fps_4cam": 20
+    },
+    {
+      "resolution": "4k",
+      "quality": 70,
+      "avg_frame_bytes": 3013107,
+      "min_frame_bytes": 2496765,
+      "max_frame_bytes": 3136990,
+      "stddev_bytes": 203895,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 723.15,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 41,
+      "max_fps_3cam": 27,
+      "max_fps_4cam": 20
+    },
+    {
+      "resolution": "4k",
+      "quality": 85,
+      "avg_frame_bytes": 3010357,
+      "min_frame_bytes": 2475486,
+      "max_frame_bytes": 3126834,
+      "stddev_bytes": 213794,
+      "frames_collected": 89,
+      "actual_fps": 28.8,
+      "per_camera_mbps_at_30fps": 722.49,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 41,
+      "max_fps_3cam": 27,
+      "max_fps_4cam": 20
+    },
+    {
+      "resolution": "4k",
+      "quality": 100,
+      "avg_frame_bytes": 3007462,
+      "min_frame_bytes": 2495425,
+      "max_frame_bytes": 3118411,
+      "stddev_bytes": 208715,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 721.79,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 41,
+      "max_fps_3cam": 27,
+      "max_fps_4cam": 20
+    },
+    {
+      "resolution": "1080p",
+      "quality": 30,
+      "avg_frame_bytes": 637865,
+      "min_frame_bytes": 505288,
+      "max_frame_bytes": 675562,
+      "stddev_bytes": 57143,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 153.09,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "1080p",
+      "quality": 50,
+      "avg_frame_bytes": 637892,
+      "min_frame_bytes": 507197,
+      "max_frame_bytes": 671623,
+      "stddev_bytes": 56388,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 153.09,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "1080p",
+      "quality": 70,
+      "avg_frame_bytes": 639881,
+      "min_frame_bytes": 506967,
+      "max_frame_bytes": 674657,
+      "stddev_bytes": 57242,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 153.57,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "1080p",
+      "quality": 85,
+      "avg_frame_bytes": 646593,
+      "min_frame_bytes": 502047,
+      "max_frame_bytes": 683597,
+      "stddev_bytes": 61487,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 155.18,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "1080p",
+      "quality": 100,
+      "avg_frame_bytes": 643206,
+      "min_frame_bytes": 505602,
+      "max_frame_bytes": 680606,
+      "stddev_bytes": 58575,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 154.37,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "720p",
+      "quality": 30,
+      "avg_frame_bytes": 288635,
+      "min_frame_bytes": 229452,
+      "max_frame_bytes": 305921,
+      "stddev_bytes": 25814,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 69.27,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "720p",
+      "quality": 50,
+      "avg_frame_bytes": 275676,
+      "min_frame_bytes": 219985,
+      "max_frame_bytes": 303166,
+      "stddev_bytes": 25907,
+      "frames_collected": 89,
+      "actual_fps": 29.1,
+      "per_camera_mbps_at_30fps": 66.16,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "720p",
+      "quality": 70,
+      "avg_frame_bytes": 286482,
+      "min_frame_bytes": 225838,
+      "max_frame_bytes": 310962,
+      "stddev_bytes": 28303,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 68.76,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "720p",
+      "quality": 85,
+      "avg_frame_bytes": 293115,
+      "min_frame_bytes": 231464,
+      "max_frame_bytes": 312520,
+      "stddev_bytes": 27971,
+      "frames_collected": 89,
+      "actual_fps": 29.1,
+      "per_camera_mbps_at_30fps": 70.35,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "720p",
+      "quality": 100,
+      "avg_frame_bytes": 294413,
+      "min_frame_bytes": 233235,
+      "max_frame_bytes": 311827,
+      "stddev_bytes": 26168,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 70.66,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "480p",
+      "quality": 30,
+      "avg_frame_bytes": 116757,
+      "min_frame_bytes": 95378,
+      "max_frame_bytes": 123635,
+      "stddev_bytes": 9560,
+      "frames_collected": 89,
+      "actual_fps": 28.5,
+      "per_camera_mbps_at_30fps": 28.02,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "480p",
+      "quality": 50,
+      "avg_frame_bytes": 117736,
+      "min_frame_bytes": 96590,
+      "max_frame_bytes": 124810,
+      "stddev_bytes": 9462,
+      "frames_collected": 89,
+      "actual_fps": 28.6,
+      "per_camera_mbps_at_30fps": 28.26,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "480p",
+      "quality": 70,
+      "avg_frame_bytes": 116699,
+      "min_frame_bytes": 94846,
+      "max_frame_bytes": 122385,
+      "stddev_bytes": 9561,
+      "frames_collected": 89,
+      "actual_fps": 28.6,
+      "per_camera_mbps_at_30fps": 28.01,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "480p",
+      "quality": 85,
+      "avg_frame_bytes": 116378,
+      "min_frame_bytes": 94742,
+      "max_frame_bytes": 122177,
+      "stddev_bytes": 9354,
+      "frames_collected": 89,
+      "actual_fps": 28.9,
+      "per_camera_mbps_at_30fps": 27.93,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    },
+    {
+      "resolution": "480p",
+      "quality": 100,
+      "avg_frame_bytes": 116339,
+      "min_frame_bytes": 94952,
+      "max_frame_bytes": 123023,
+      "stddev_bytes": 9659,
+      "frames_collected": 89,
+      "actual_fps": 28.8,
+      "per_camera_mbps_at_30fps": 27.92,
+      "max_fps_1cam": 60,
+      "max_fps_2cam": 60,
+      "max_fps_3cam": 60,
+      "max_fps_4cam": 60
+    }
+  ],
+  "concurrent_results": [
+    {
+      "resolution": "720p",
+      "quality": 85,
+      "num_cameras": 2,
+      "avg_frame_bytes": 319739,
+      "total_actual_mbps": 144.48,
+      "per_camera_results": [
+        {
+          "avg_bytes": 275062,
+          "actual_fps": 27.9
+        },
+        {
+          "avg_bytes": 364416,
+          "actual_fps": 28.5
+        }
+      ]
+    },
+    {
+      "resolution": "720p",
+      "quality": 85,
+      "num_cameras": 3,
+      "avg_frame_bytes": 314232,
+      "total_actual_mbps": 214.12,
+      "per_camera_results": [
+        {
+          "avg_bytes": 289456,
+          "actual_fps": 28.8
+        },
+        {
+          "avg_bytes": 364393,
+          "actual_fps": 28.3
+        },
+        {
+          "avg_bytes": 288848,
+          "actual_fps": 28.1
+        }
+      ]
+    },
+    {
+      "resolution": "720p",
+      "quality": 85,
+      "num_cameras": 4,
+      "avg_frame_bytes": 352048,
+      "total_actual_mbps": 321.46,
+      "per_camera_results": [
+        {
+          "avg_bytes": 294675,
+          "actual_fps": 28.5
+        },
+        {
+          "avg_bytes": 370016,
+          "actual_fps": 28.8
+        },
+        {
+          "avg_bytes": 288888,
+          "actual_fps": 28.6
+        },
+        {
+          "avg_bytes": 454613,
+          "actual_fps": 28.3
+        }
+      ]
+    },
+    {
+      "resolution": "1080p",
+      "quality": 85,
+      "num_cameras": 2,
+      "avg_frame_bytes": 716932,
+      "total_actual_mbps": 329.62,
+      "per_camera_results": [
+        {
+          "avg_bytes": 648044,
+          "actual_fps": 28.9
+        },
+        {
+          "avg_bytes": 785820,
+          "actual_fps": 28.6
+        }
+      ]
+    },
+    {
+      "resolution": "1080p",
+      "quality": 85,
+      "num_cameras": 3,
+      "avg_frame_bytes": 682712,
+      "total_actual_mbps": 472.49,
+      "per_camera_results": [
+        {
+          "avg_bytes": 653772,
+          "actual_fps": 29.1
+        },
+        {
+          "avg_bytes": 786972,
+          "actual_fps": 28.8
+        },
+        {
+          "avg_bytes": 607392,
+          "actual_fps": 28.6
+        }
+      ]
+    },
+    {
+      "resolution": "1080p",
+      "quality": 85,
+      "num_cameras": 4,
+      "avg_frame_bytes": 795957,
+      "total_actual_mbps": 722.0,
+      "per_camera_results": [
+        {
+          "avg_bytes": 644748,
+          "actual_fps": 28.8
+        },
+        {
+          "avg_bytes": 788375,
+          "actual_fps": 28.3
+        },
+        {
+          "avg_bytes": 660027,
+          "actual_fps": 28.2
+        },
+        {
+          "avg_bytes": 1090679,
+          "actual_fps": 28.2
+        }
+      ]
+    },
+    {
+      "resolution": "1080p",
+      "quality": 50,
+      "num_cameras": 2,
+      "avg_frame_bytes": 724367,
+      "total_actual_mbps": 332.41,
+      "per_camera_results": [
+        {
+          "avg_bytes": 655707,
+          "actual_fps": 28.9
+        },
+        {
+          "avg_bytes": 793028,
+          "actual_fps": 28.5
+        }
+      ]
+    },
+    {
+      "resolution": "1080p",
+      "quality": 50,
+      "num_cameras": 3,
+      "avg_frame_bytes": 691845,
+      "total_actual_mbps": 471.39,
+      "per_camera_results": [
+        {
+          "avg_bytes": 660499,
+          "actual_fps": 28.6
+        },
+        {
+          "avg_bytes": 799025,
+          "actual_fps": 27.9
+        },
+        {
+          "avg_bytes": 616011,
+          "actual_fps": 28.8
+        }
+      ]
+    },
+    {
+      "resolution": "1080p",
+      "quality": 50,
+      "num_cameras": 4,
+      "avg_frame_bytes": 793456,
+      "total_actual_mbps": 725.45,
+      "per_camera_results": [
+        {
+          "avg_bytes": 656920,
+          "actual_fps": 28.2
+        },
+        {
+          "avg_bytes": 787745,
+          "actual_fps": 28.9
+        },
+        {
+          "avg_bytes": 639903,
+          "actual_fps": 28.5
+        },
+        {
+          "avg_bytes": 1089259,
+          "actual_fps": 28.6
+        }
+      ]
+    }
+  ]
+}

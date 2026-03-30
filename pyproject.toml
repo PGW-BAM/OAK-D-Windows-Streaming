@@ -1,0 +1,30 @@
+[project]
+name = "oak-d-streaming"
+version = "0.1.0"
+description = "Multi-camera OAK-D 4 Pro browser streaming dashboard"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.115",
+    "uvicorn[standard]>=0.34",
+    "depthai>=3.3.0",
+    "numpy>=2.0",
+    "opencv-python>=4.10",
+    "av>=14.0",
+    "aiofiles>=24.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+]
+
+[project.optional-dependencies]
+host-inference = [
+    "ultralytics>=8.0",
+    "torch>=2.0",
+    "torchvision>=0.20",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
