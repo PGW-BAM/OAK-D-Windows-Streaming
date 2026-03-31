@@ -1,0 +1,47 @@
+# Example: 3x3 Grid Scan for Camera 1
+# Copy and modify this file to create your own capture sequences.
+
+sequence_id: "grid-scan-001"
+name: "3x3 Grid Scan — Camera 1"
+mode: "sequential"
+repeat_count: 1
+
+steps:
+  # Row 1
+  - cam_id: cam1
+    position: { drive_a: 0.0, drive_b: 0.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 10.0, drive_b: 0.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 20.0, drive_b: 0.0 }
+    settling_delay_ms: 150
+
+  # Row 2
+  - cam_id: cam1
+    position: { drive_a: 0.0, drive_b: 10.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 10.0, drive_b: 10.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 20.0, drive_b: 10.0 }
+    settling_delay_ms: 150
+
+  # Row 3
+  - cam_id: cam1
+    position: { drive_a: 0.0, drive_b: 20.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 10.0, drive_b: 20.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 20.0, drive_b: 20.0 }
+    settling_delay_ms: 150

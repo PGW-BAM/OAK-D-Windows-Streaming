@@ -19,6 +19,12 @@ frontend/dist/
 # Environment
 .env
 
+# SQLite data
+data/
+
+# Unsent alert logs
+logs/
+
 # OS
 .DS_Store
 Thumbs.db

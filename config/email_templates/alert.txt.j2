@@ -1,0 +1,36 @@
+OAK-D Drive Sync Alert
+======================
+
+Alert Type:  {{ alert.alert_type }}
+Severity:    {{ alert.severity | upper }}
+Component:   {{ alert.component }}
+Time:        {{ alert.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC') }}
+
+Message
+-------
+{{ alert.message }}
+
+{% if alert.system_state %}
+Current System State
+--------------------
+Pi Online:        {{ 'YES' if alert.system_state.pi_online else 'NO' }}
+Broker Connected: {{ 'YES' if alert.system_state.broker_connected else 'NO' }}
+
+Cameras:
+{% for cam_id, state in alert.system_state.cameras.items() %}
+  {{ cam_id }}: {{ state }}
+{% endfor %}
+
+Drives:
+{% for drive_id, state in alert.system_state.drives.items() %}
+  {{ drive_id }}: {{ state }}
+{% endfor %}
+{% endif %}
+
+Suggested Remediation
+---------------------
+{{ remediation }}
+
+---
+This alert was sent by OAK-D Drive Sync on the Windows controller.
+To change alert settings, edit config/mqtt.yaml.

@@ -1,0 +1,51 @@
+# Connectivity Monitoring & Overlay Configuration
+
+overlay:
+  enabled: true
+  position: "top"                # top | bottom
+  alpha: 0.6                     # Transparency (0.0 = invisible, 1.0 = opaque)
+  update_hz: 1.0                 # Overlay data refresh rate
+  toggle_key: "H"                # Keyboard toggle
+
+history:
+  retention_hours: 24            # Rolling window for SQLite history
+  cleanup_interval_s: 3600       # How often to prune old records
+
+components:
+  - name: pi
+    type: heartbeat
+    topic: "health/pi"
+    healthy_interval_s: 6
+    alert_threshold_s: 10
+
+  - name: broker
+    type: connection
+    alert_threshold_s: 10
+
+  - name: cam1
+    type: heartbeat
+    topic: "health/cameras/cam1"
+    healthy_interval_s: 6
+    alert_threshold_s: 15
+
+  - name: cam2
+    type: heartbeat
+    topic: "health/cameras/cam2"
+    healthy_interval_s: 6
+    alert_threshold_s: 15
+
+  - name: "cam1:a"
+    type: drive
+    topic: "status/drives/cam1/position"
+
+  - name: "cam1:b"
+    type: drive
+    topic: "status/drives/cam1/position"
+
+  - name: "cam2:a"
+    type: drive
+    topic: "status/drives/cam2/position"
+
+  - name: "cam2:b"
+    type: drive
+    topic: "status/drives/cam2/position"

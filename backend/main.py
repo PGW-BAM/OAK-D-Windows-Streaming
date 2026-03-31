@@ -47,13 +47,36 @@ logger = logging.getLogger(__name__)
 camera_manager = CameraManager()
 recording_workers: dict[str, RecordingWorker] = {}
 
+# MQTT service (lazy — only started if broker is configured)
+mqtt_service = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    global mqtt_service
+
     logger.info("Starting camera discovery …")
     ids = camera_manager.discover()
     logger.info("Found %d camera(s) at startup: %s", len(ids), ids)
+
+    # Start MQTT service (non-blocking, auto-reconnects in background)
+    try:
+        from .mqtt.service import MqttService
+        mqtt_service = MqttService(camera_manager)
+        await mqtt_service.start()
+    except Exception as exc:
+        logger.warning("MQTT service failed to start (standalone mode): %s", exc)
+        mqtt_service = None
+
     yield
+
+    # Shutdown MQTT
+    if mqtt_service:
+        try:
+            await mqtt_service.stop()
+        except Exception as exc:
+            logger.warning("MQTT shutdown error: %s", exc)
+
     logger.info("Shutting down camera manager …")
     camera_manager.shutdown()
 
@@ -511,3 +534,106 @@ async def ws_camera(websocket: WebSocket, camera_id: str) -> None:
         logger.info("WebSocket disconnected for camera %s", camera_id)
     except Exception as exc:
         logger.warning("WebSocket error for camera %s: %s", camera_id, exc)
+
+
+# ---------------------------------------------------------------------------
+# MQTT status & control
+# ---------------------------------------------------------------------------
+
+@app.get("/api/mqtt/status", response_model=ApiResponse)
+async def mqtt_status() -> ApiResponse:
+    """Return MQTT connection state and component health."""
+    if not mqtt_service:
+        return ApiResponse(ok=True, message="MQTT not active (standalone mode)", data={
+            "connected": False,
+            "mode": "standalone",
+        })
+    state = mqtt_service.monitor.get_state()
+    orch = mqtt_service.orchestrator
+    return ApiResponse(ok=True, message="ok", data={
+        "connected": mqtt_service.is_connected,
+        "mode": "mqtt",
+        "pi_online": state.pi_online,
+        "broker_connected": state.broker_connected,
+        "cameras": state.cameras,
+        "drives": state.drives,
+        "orchestrator_state": orch.state.value,
+        "active_sequence": orch.active_sequence.name if orch.active_sequence else None,
+        "sequence_progress": orch.progress,
+        "total_captures": orch.total_captures,
+    })
+
+
+@app.get("/api/mqtt/connectivity", response_model=ApiResponse)
+async def mqtt_connectivity() -> ApiResponse:
+    """Return detailed connectivity state for all components."""
+    if not mqtt_service:
+        return ApiResponse(ok=False, message="MQTT not active")
+    state = mqtt_service.monitor.get_state()
+    return ApiResponse(ok=True, message="ok", data=state.model_dump(mode="json"))
+
+
+@app.post("/api/mqtt/sequence/start", response_model=ApiResponse)
+async def start_sequence(body: dict) -> ApiResponse:
+    """Start a capture sequence from a YAML file or inline definition."""
+    if not mqtt_service:
+        raise HTTPException(503, "MQTT service not active")
+
+    file_path = body.get("file")
+    if file_path:
+        try:
+            seq = await mqtt_service.orchestrator.load_sequence_file(file_path)
+        except FileNotFoundError:
+            raise HTTPException(404, f"Sequence file not found: {file_path}")
+        except Exception as exc:
+            raise HTTPException(422, f"Invalid sequence file: {exc}")
+    else:
+        from .mqtt.models import CaptureSequence
+        try:
+            seq = CaptureSequence(**body)
+        except Exception as exc:
+            raise HTTPException(422, f"Invalid sequence definition: {exc}")
+
+    try:
+        await mqtt_service.orchestrator.start_sequence(seq)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    return ApiResponse(ok=True, message=f"Sequence '{seq.name}' started", data={
+        "sequence_id": seq.sequence_id,
+        "steps": len(seq.steps),
+        "repeats": seq.repeat_count,
+    })
+
+
+@app.post("/api/mqtt/sequence/stop", response_model=ApiResponse)
+async def stop_sequence() -> ApiResponse:
+    if not mqtt_service:
+        raise HTTPException(503, "MQTT service not active")
+    await mqtt_service.orchestrator.stop_sequence()
+    return ApiResponse(ok=True, message="Sequence stopped")
+
+
+@app.get("/api/mqtt/sequences", response_model=ApiResponse)
+async def list_sequences() -> ApiResponse:
+    """List available sequence YAML files from config/sequences/."""
+    seq_dir = Path(__file__).parent.parent / "config" / "sequences"
+    if not seq_dir.exists():
+        return ApiResponse(ok=True, message="ok", data=[])
+    files = sorted(str(f.name) for f in seq_dir.glob("*.yaml"))
+    return ApiResponse(ok=True, message="ok", data=files)
+
+
+@app.get("/api/mqtt/history/connectivity", response_model=ApiResponse)
+async def connectivity_history(component: str | None = None, limit: int = 100) -> ApiResponse:
+    if not mqtt_service:
+        raise HTTPException(503, "MQTT service not active")
+    records = await mqtt_service.history.get_recent_connectivity(component, limit)
+    return ApiResponse(ok=True, message="ok", data=records)
+
+
+@app.get("/api/mqtt/history/alerts", response_model=ApiResponse)
+async def alert_history(limit: int = 50) -> ApiResponse:
+    if not mqtt_service:
+        raise HTTPException(503, "MQTT service not active")
+    records = await mqtt_service.history.get_recent_alerts(limit)
+    return ApiResponse(ok=True, message="ok", data=records)

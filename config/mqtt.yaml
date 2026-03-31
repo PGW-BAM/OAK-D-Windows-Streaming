@@ -1,0 +1,41 @@
+# MQTT Broker and Orchestration Configuration
+# Env-var overrides: MQTT_BROKER_HOST, MQTT_BROKER_PORT, OAK_ALERT_EMAIL, OAK_SMTP_HOST, OAK_SMTP_PASSWORD
+
+broker:
+  host: "192.168.1.100"          # Raspberry Pi IP address
+  port: 1883
+  keepalive: 30
+  clean_session: false
+  reconnect_min_s: 1.0
+  reconnect_max_s: 30.0
+
+orchestration:
+  move_timeout_s: 30.0           # Max time to wait for drive to reach target
+  capture_timeout_s: 10.0        # Max time for a single capture
+  default_settling_ms: 150       # Wait after drive reaches position (50-500ms)
+  puback_timeout_s: 5.0
+
+alerts:
+  enabled: true
+  email: ""                      # Operator fills in at first run
+
+  smtp:
+    host: ""                     # e.g. smtp.gmail.com
+    port: 587
+    use_tls: true
+    username: ""
+    password: ""                 # Or set OAK_SMTP_PASSWORD env var
+
+  thresholds:
+    pi_offline_s: 10.0
+    camera_offline_s: 15.0
+    broker_offline_s: 10.0
+
+  dedup_window_s: 300            # Same alert type max once per 5 min
+  max_alerts_per_hour: 20
+
+health_interval_s: 2.0           # Win controller health beacon interval
+
+cam_ids:
+  - cam1
+  - cam2
