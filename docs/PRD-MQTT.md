@@ -106,15 +106,20 @@ There is currently no coordination layer between the drive positioning (Pi) and 
 
 ### 3.4 Network Topology
 
-All devices on the same LAN subnet. PoE++ switch provides power to cameras and connectivity.
+All devices on the same `169.254.0.0/16` link-local subnet via a PoE++ switch.
 
 ```
-Windows 11 ──┐
-OAK-D #1 ────┤── PoE++ Switch ──── Raspberry Pi 5
-OAK-D #2 ────┘
+Windows 11 (169.254.x.x) ──┐
+OAK-D #1 (169.254.236.75) ─┤── PoE++ Switch ──── Raspberry Pi 5
+OAK-D #2 (169.254.106.74) ─┘                     eth0: 169.254.10.10/16 (static)
+                                                  wlan0: DHCP (WiFi, internet)
 ```
+
+The Pi uses **dual networking**: Ethernet (`eth0`) with a static IP on the camera LAN for MQTT and drive control, and WiFi (`wlan0`) for internet access. No gateway or DNS is configured on `eth0`.
 
 MQTT over TCP 1883 (optionally 8883 with TLS). Camera data flows over DepthAI/XLink directly between cameras and Windows PC — MQTT carries only coordination messages, not image data.
+
+**Windows note:** The MQTT client uses a dedicated `SelectorEventLoop` thread because Windows' default `ProactorEventLoop` does not support the `add_reader`/`add_writer` calls required by paho-mqtt.
 
 ## 4. MQTT Topic Schema
 

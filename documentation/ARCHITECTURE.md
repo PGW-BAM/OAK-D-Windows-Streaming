@@ -114,6 +114,122 @@ Types: `LayoutItem` = single item `{i,x,y,w,h}`, `Layout = readonly LayoutItem[]
 
 ---
 
+---
+
+## MQTT Service (`backend/mqtt/`)
+
+### Overview
+
+The MQTT integration layer connects the Windows camera app to the Raspberry Pi drive controller via Mosquitto. It is designed for **graceful degradation** — if the broker is unreachable, the camera app runs normally in standalone mode.
+
+### Architecture
+
+```
+FastAPI Lifespan
+└── MqttService (service.py) ── facade owning all subsystems
+    ├── MqttClient (client.py) ── async MQTT with auto-reconnect
+    │   └── Dedicated SelectorEventLoop thread (Windows compatibility)
+    ├── SequenceRunner (orchestrator.py) ── move→settle→capture state machine
+    ├── ConnectivityMonitor (monitor.py) ── health tracking + threshold alerts
+    ├── EmailAlertSender (alerts.py) ── SMTP + Jinja2 + JSONL fallback
+    └── HistoryDB (history.py) ── SQLite connectivity/alert log
+```
+
+### Windows asyncio Compatibility
+
+Windows uses `ProactorEventLoop` by default, which doesn't support `add_reader`/`add_writer` (required by paho-mqtt). The MQTT client solves this by running in a **dedicated background thread** with its own `asyncio.SelectorEventLoop`. Message handler callbacks are dispatched back to the main FastAPI event loop via `asyncio.run_coroutine_threadsafe()`.
+
+### MqttClient (`client.py`)
+
+Thread-safe async MQTT client:
+- **Connection:** Runs `_run_loop()` in a dedicated `SelectorEventLoop` thread
+- **Auto-reconnect:** Exponential backoff (1s → 30s) on disconnect
+- **LWT:** Publishes `{"online": false}` to `health/win_controller` on unexpected disconnect
+- **Publish:** `await client.publish(topic, pydantic_model)` — auto-serializes to JSON, thread-safe via `run_coroutine_threadsafe`
+- **Subscribe:** `client.on("topic/+/pattern", handler)` — handlers run on the main event loop
+- **Topic matching:** Supports MQTT wildcards (`+` single-level, `#` multi-level)
+
+### SequenceRunner / Orchestrator (`orchestrator.py`)
+
+State machine for automated capture sequences:
+
+```
+IDLE → MOVING → SETTLING → CAPTURING → IDLE (next step)
+                                     → ERROR (on failure)
+         ↕
+       PAUSED
+```
+
+**Workflow per step:**
+1. Publish `MoveCommand` for both axes (drive_a, drive_b) to `cmd/drives/{cam_id}/move`
+2. Wait for `DrivePosition` with `state="reached"` from both axes (30s timeout)
+3. Wait settling delay (default 150ms, configurable per step)
+4. Call existing `CameraWorker.capture_snapshot()` via `run_in_executor`
+5. Save JPEG + JSON metadata (drive positions, sequence ID, timestamps) to `recordings/{cam_id}/sequences/{seq_id}/`
+6. Advance to next step
+
+**Error handling:** Move timeout → sends `StopCommand` + publishes `OrchestrationError`. Capture timeout → retry once, then skip.
+
+### ConnectivityMonitor (`monitor.py`)
+
+Subscribes to `health/#`, `status/drives/+/position`, and `error/#`. Maintains real-time state for:
+- Pi controller (heartbeat-based, 6s healthy, 10s alert)
+- MQTT broker (connection state)
+- Cameras (heartbeat-based, 15s alert)
+- Drives (position status, fault detection)
+
+Publishes aggregated `ConnectivityState` to `monitoring/connectivity` (retained) every second. Fires alerts with deduplication (5-min window) and rate limiting (20/hour).
+
+### EmailAlertSender (`alerts.py`)
+
+- Renders alerts via Jinja2 template (`config/email_templates/alert.txt.j2`)
+- Sends via `aiosmtplib` (async SMTP with TLS)
+- Falls back to appending to `logs/unsent_alerts.jsonl` if SMTP fails
+- Alert types: `pi_offline`, `broker_offline`, `camera_offline`, `drive_fault`, `sequence_aborted`, `capture_failure`
+
+### HistoryDB (`history.py`)
+
+SQLite database at `data/connectivity.db`:
+- `connectivity_log` table: component state transitions with timestamps
+- `alert_log` table: fired alerts with email delivery status
+- 24-hour rolling window with periodic cleanup
+
+### Configuration (`config/mqtt.yaml`)
+
+Loaded by `backend/mqtt/config.py` with env-var overrides:
+
+| Setting | Default | Env Override |
+|---------|---------|-------------|
+| `broker.host` | `169.254.10.10` | `MQTT_BROKER_HOST` |
+| `broker.port` | `1883` | `MQTT_BROKER_PORT` |
+| `alerts.email` | `""` | `OAK_ALERT_EMAIL` |
+| `alerts.smtp.host` | `""` | `OAK_SMTP_HOST` |
+| `alerts.smtp.password` | `""` | `OAK_SMTP_PASSWORD` |
+
+### MQTT Message Models (`models.py`)
+
+14 Pydantic v2 models shared between Windows and Pi:
+
+| Category | Models |
+|----------|--------|
+| Commands (Win → Pi) | `MoveCommand`, `HomeCommand`, `StopCommand` |
+| Status (Pi → Win) | `DrivePosition`, `CameraStatusMqtt` |
+| Health | `PiHealth`, `WinControllerHealth`, `CameraHealth` |
+| Errors | `DriveError`, `CameraError`, `OrchestrationError` |
+| Monitoring | `ConnectivityState`, `AlertEvent` |
+| Sequences | `CaptureSequence`, `CaptureStep`, `PositionTarget` |
+
+### Topic Constants (`topics.py`)
+
+All MQTT topics defined as static methods on `Topics` class — never hardcoded strings:
+```python
+Topics.cmd_move("cam1")           # "cmd/drives/cam1/move"
+Topics.health_pi()                # "health/pi"
+Topics.status_drive_position("cam2")  # "status/drives/cam2/position"
+```
+
+---
+
 ## Configuration (`backend/config.py`)
 
 All settings can be overridden via `.env` file or environment variables:

@@ -130,7 +130,28 @@ drives:
       home_direction: -1
 ```
 
-### 2.2 Stepper Driver Wiring
+### 2.2 Network Configuration
+
+The Pi uses **dual networking**:
+- **`eth0`** — Static IP `169.254.10.10/16` on the PoE switch LAN (cameras + Windows PC)
+- **`wlan0`** — DHCP via WiFi router (internet access)
+
+```bash
+# Set static IP on eth0 (no gateway — internet stays on WiFi)
+sudo nmcli con mod "Wired connection 1" \
+  ipv4.addresses 169.254.10.10/16 \
+  ipv4.method manual \
+  ipv4.gateway "" \
+  ipv4.dns ""
+sudo nmcli con up "Wired connection 1"
+
+# Verify
+ip addr show eth0          # should show 169.254.10.10/16
+ping 169.254.236.75        # should reach camera
+ping google.com            # should still work via WiFi
+```
+
+### 2.3 Stepper Driver Wiring
 
 Typical A4988 or DRV8825 stepper driver wiring:
 
@@ -863,7 +884,7 @@ def load_config() -> dict:
 
 async def main() -> None:
     config = load_config()
-    broker_host = config.get("broker_host", "localhost")
+    broker_host = config.get("broker_host", "169.254.10.10")
     broker_port = config.get("broker_port", 1883)
 
     # Initialize drives
@@ -1024,7 +1045,7 @@ After a fault, the drive stays in `fault` state until:
 
 ```yaml
 # /home/pi/oak-drive-controller/config/drive_pinmap.yaml
-broker_host: "localhost"
+broker_host: "169.254.10.10"       # Pi static IP on PoE switch LAN
 broker_port: 1883
 
 drives:

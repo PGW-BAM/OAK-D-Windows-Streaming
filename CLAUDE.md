@@ -4,40 +4,51 @@
 
 This is an **existing** camera control project for 2× Luxonis OAK-D 4 Pro cameras connected via PoE++ to a Windows 11 machine. The cameras are mounted on mechanical positioning drives (4 drives total, 2 per camera) controlled by a Raspberry Pi 5 via GPIO.
 
-**The goal of this extension** is to add MQTT-based coordination between the Windows camera control software and the Pi drive controller, plus connectivity monitoring, a streaming overlay, and email alerting.
+The Windows side now has a complete MQTT integration layer. The Pi drive controller is documented but not yet implemented (see `docs/RASPBERRY_PI_IMPLEMENTATION.md`).
 
 ## System Topology
 
 ```
-┌─────────────────────┐       PoE++ Switch        ┌──────────────────┐
-│  Windows 11 PC      │◄──────────────────────────►│ OAK-D 4 Pro #1  │
-│  - Existing cam app  │◄──────────────────────────►│ OAK-D 4 Pro #2  │
-│  - MQTT orchestration│       Ethernet             │                  │
-│  - Monitoring/overlay│◄──────────────────────────►│ Raspberry Pi 5   │
-│  - Email alerts      │       (MQTT over TCP)      │  - 4× GPIO drives│
-└─────────────────────┘                             │  - MQTT client   │
-                                                    │  - Mosquitto     │
-                                                    └──────────────────┘
+Windows 11 PC (169.254.x.x) ──┐
+  - Camera app (FastAPI)        │
+  - MQTT orchestration          ├── PoE++ Switch (169.254.0.0/16)
+  - Monitoring + email alerts   │
+                                │
+OAK-D 4 Pro #1 (169.254.236.75)┤
+OAK-D 4 Pro #2 (169.254.106.74)┤
+                                │
+Raspberry Pi 5 ─────────────────┘
+  eth0: 169.254.10.10/16 (static — PoE LAN, Mosquitto broker)
+  wlan0: DHCP (WiFi — internet)
+  - 4× GPIO drives (not yet implemented)
 ```
 
-## What Already Exists
+## What Is Implemented
 
-- Camera discovery, pipeline setup, image capture via DepthAI SDK
-- Interval-based recording logic on the Windows machine
-- Camera streaming / preview functionality
+### Windows side (complete)
+- Camera discovery, pipeline setup, MJPEG streaming, recording via DepthAI SDK
+- React frontend with draggable camera grid, controls, detection overlay
+- **MQTT client** with auto-reconnect, LWT, Pydantic serialization (`backend/mqtt/client.py`)
+  - Uses dedicated `SelectorEventLoop` thread for Windows compatibility
+- **Orchestrator** — move→settle→capture state machine (`backend/mqtt/orchestrator.py`)
+- **Connectivity monitor** — health tracking, threshold alerting (`backend/mqtt/monitor.py`)
+- **Email alerts** — SMTP + Jinja2 + JSONL fallback (`backend/mqtt/alerts.py`)
+- **SQLite history** — 24h rolling connectivity/alert log (`backend/mqtt/history.py`)
+- **REST API** — `/api/mqtt/status`, `/api/mqtt/sequence/*`, `/api/mqtt/history/*`
+- **Config** — `config/mqtt.yaml` (broker, orchestration, alerts, SMTP)
 
-**Before writing any code**, every agent MUST first explore the existing codebase to understand the current architecture, file layout, naming conventions, and patterns. Use `find`, `grep`, and `cat` to map out what's there. Then integrate — don't rewrite.
+### Pi side (documented, not coded)
+- `docs/RASPBERRY_PI_IMPLEMENTATION.md` — full guide with GPIO wiring, Mosquitto setup, drive controller reference code, systemd services
+- Mosquitto broker running at `169.254.10.10:1883`
 
-## What Needs to Be Added
+## What Still Needs Work
 
-See `docs/PRD-MQTT.md` for the full specification. In summary:
+1. **Pi drive controller implementation** — GPIO stepper control + MQTT client (documented in `docs/RASPBERRY_PI_IMPLEMENTATION.md`)
+2. **Streaming overlay** — render connectivity status onto camera preview (Phase 2)
+3. **cam_id mapping by serial number** — currently positional (cam1=first discovered)
+4. **First-run email prompt** — operator must manually edit `config/mqtt.yaml`
 
-1. **MQTT communication layer** — Mosquitto broker on Pi, async clients on both sides
-2. **Pi drive controller** — GPIO-based drive positioning, MQTT command listener, health beacons
-3. **Orchestration** — move→confirm→settle→capture workflow wired into the existing camera app
-4. **Connectivity monitoring** — track health of all components via MQTT heartbeats
-5. **Streaming overlay** — render connection status, drive positions, sequence progress onto camera preview
-6. **Email alerts** — notify operator on failures (configurable address, SMTP, deduplication)
+**Before writing any code**, every agent MUST first explore the existing codebase to understand the current architecture, file layout, naming conventions, and patterns. Then integrate — don't rewrite.
 
 ## Agent Architecture
 

@@ -192,6 +192,93 @@ Manually triggers rolling deletion of oldest recordings until below threshold.
 
 ---
 
+## MQTT Orchestration & Monitoring
+
+### `GET /api/mqtt/status`
+Returns MQTT connection state, component health, and sequence progress.
+
+**Response:**
+```json
+{
+  "ok": true,
+  "message": "ok",
+  "data": {
+    "connected": true,
+    "mode": "mqtt",
+    "pi_online": true,
+    "broker_connected": true,
+    "cameras": { "cam1": "online", "cam2": "online" },
+    "drives": { "cam1:a": "idle", "cam1:b": "idle" },
+    "orchestrator_state": "idle",
+    "active_sequence": null,
+    "sequence_progress": "",
+    "total_captures": 0
+  }
+}
+```
+
+When MQTT is not active (broker unreachable): `"mode": "standalone"`, `"connected": false`.
+
+### `GET /api/mqtt/connectivity`
+Returns the full `ConnectivityState` model with all tracked components.
+
+**Response:** `{ "ok": true, "data": { "pi_online": true, "broker_connected": true, "cameras": {...}, "drives": {...}, "last_update": "..." } }`
+
+### `POST /api/mqtt/sequence/start`
+Start a capture sequence. Accepts either a YAML file path or an inline sequence definition.
+
+**From file:**
+```json
+{ "file": "config/sequences/example_grid_scan.yaml" }
+```
+
+**Inline:**
+```json
+{
+  "sequence_id": "my-scan-001",
+  "name": "Quick Scan",
+  "mode": "sequential",
+  "repeat_count": 1,
+  "steps": [
+    { "cam_id": "cam1", "position": { "drive_a": 0.0, "drive_b": 0.0 }, "settling_delay_ms": 150 },
+    { "cam_id": "cam1", "position": { "drive_a": 10.0, "drive_b": 0.0 }, "settling_delay_ms": 150 }
+  ]
+}
+```
+
+**Response:** `{ "ok": true, "message": "Sequence 'Quick Scan' started", "data": { "sequence_id": "my-scan-001", "steps": 2, "repeats": 1 } }`
+
+Returns 409 if a sequence is already running. Returns 503 if MQTT is not active.
+
+### `POST /api/mqtt/sequence/stop`
+Stop the currently running capture sequence. Sends stop commands to all drives.
+
+**Response:** `{ "ok": true, "message": "Sequence stopped" }`
+
+### `GET /api/mqtt/sequences`
+List available sequence YAML files from `config/sequences/`.
+
+**Response:** `{ "ok": true, "data": ["example_grid_scan.yaml"] }`
+
+### `GET /api/mqtt/history/connectivity`
+Query recent connectivity state transitions.
+
+**Query params:**
+- `component` (optional) — filter by component name (e.g., `pi`, `cam1`, `broker`)
+- `limit` (optional, default 100) — max records to return
+
+**Response:** `{ "ok": true, "data": [{ "component": "pi", "state": "offline", "timestamp": "...", "duration_s": 12.5 }, ...] }`
+
+### `GET /api/mqtt/history/alerts`
+Query recent alerts.
+
+**Query params:**
+- `limit` (optional, default 50) — max records to return
+
+**Response:** `{ "ok": true, "data": [{ "alert_type": "pi_offline", "component": "pi", "message": "...", "email_sent": true, "timestamp": "..." }, ...] }`
+
+---
+
 ## Frontend
 
 ### `GET /`

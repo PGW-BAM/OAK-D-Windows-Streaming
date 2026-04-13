@@ -1,7 +1,7 @@
 # OAK-D Streaming Dashboard — Project State
 
-**Last updated:** 2026-03-09
-**Status:** MVP scaffolding complete, ready for hardware testing
+**Last updated:** 2026-04-13
+**Status:** Camera streaming MVP complete + MQTT drive sync integration implemented
 
 ---
 
@@ -18,6 +18,12 @@ A full-stack multi-camera OAK-D 4 Pro browser streaming dashboard, implementing 
 | Video mux | PyAV | 16.1 |
 | Image proc | OpenCV-Python | 4.13 |
 | Data models | Pydantic v2 + pydantic-settings | 2.12 |
+| MQTT client | aiomqtt (paho-mqtt backend) | 2.5.1 |
+| Async SMTP | aiosmtplib | 5.1.0 |
+| Async SQLite | aiosqlite | 0.22.1 |
+| Templating | Jinja2 | 3.1+ |
+| Logging | structlog | 25.5.0 |
+| Config | PyYAML | 6.0+ |
 | Frontend build | Vite 7 + React 19 + TypeScript | — |
 | Grid layout | react-grid-layout | 2.2.2 |
 
@@ -41,7 +47,29 @@ OAK-D_streaming/
 │   ├── models.py              # All Pydantic request/response models
 │   ├── camera_manager.py      # CameraManager + CameraWorker (thread-per-camera)
 │   ├── recording.py           # VideoRecorder, IntervalRecorder, RecordingWorker
-│   └── main.py                # FastAPI app + all API endpoints + lifespan
+│   ├── main.py                # FastAPI app + all API endpoints + lifespan
+│   └── mqtt/                  # MQTT drive sync integration
+│       ├── __init__.py
+│       ├── models.py          # 14 Pydantic MQTT message types (commands, status, health, errors)
+│       ├── topics.py          # MQTT topic constants (single source of truth)
+│       ├── config.py          # YAML + env-var config loader (broker, alerts, orchestration)
+│       ├── client.py          # Async MQTT client (SelectorEventLoop thread for Windows)
+│       ├── orchestrator.py    # Move → settle → capture state machine + sequence runner
+│       ├── monitor.py         # Real-time component health tracking + threshold alerting
+│       ├── history.py         # SQLite connectivity + alert history (24h rolling)
+│       ├── alerts.py          # Email alerts via aiosmtplib + Jinja2 templates
+│       └── service.py         # Top-level facade wiring all MQTT subsystems
+│
+├── config/
+│   ├── mqtt.yaml              # Broker host/port, orchestration timeouts, SMTP, alert thresholds
+│   ├── monitoring.yaml        # Component health definitions, overlay settings
+│   ├── sequences/             # Capture sequence YAML definitions
+│   │   └── example_grid_scan.yaml
+│   └── email_templates/
+│       └── alert.txt.j2       # Jinja2 email alert template
+│
+├── data/                      # (gitignored) SQLite connectivity database
+├── logs/                      # (gitignored) Unsent alert fallback logs
 │
 ├── frontend/
 │   ├── package.json
@@ -57,6 +85,10 @@ OAK-D_streaming/
 │           ├── CameraCard.tsx      # Single camera tile (MJPEG img + status bar)
 │           ├── DetectionOverlay.tsx # Canvas bounding box renderer
 │           └── ControlPanel.tsx    # Right-side drawer: camera controls + recording + AI
+│
+├── docs/
+│   ├── PRD-MQTT.md            # Full MQTT system specification
+│   └── RASPBERRY_PI_IMPLEMENTATION.md  # Pi-side implementation guide
 │
 └── documentation/             # This folder
     ├── PROJECT_STATE.md       # ← you are here
@@ -109,3 +141,50 @@ On startup, `CameraManager.discover()` calls `dai.Device.getAllAvailableDevices(
 - Windows Firewall: allow Python on the PoE adapter (UDP broadcast + TCP)
 
 The `POST /api/cameras/discover` endpoint triggers a manual rescan at runtime.
+
+---
+
+## Network Topology
+
+```
+Windows 11 PC ─────┐
+  169.254.x.x       │
+                     ├── PoE++ Switch (169.254.0.0/16 link-local LAN)
+OAK-D #1 ──────────┤
+  169.254.236.75     │
+OAK-D #2 ──────────┤
+  169.254.106.74     │
+                     │
+Raspberry Pi 5 ─────┘
+  eth0: 169.254.10.10/16 (static — PoE LAN, cameras + MQTT)
+  wlan0: DHCP (WiFi — internet access)
+```
+
+- The PoE switch carries both camera data (DepthAI/XLink) and MQTT traffic
+- The Pi runs Mosquitto broker on port 1883, accessible at `169.254.10.10`
+- The Pi uses WiFi for internet; Ethernet is dedicated to the camera LAN
+
+---
+
+## MQTT Integration
+
+The MQTT service starts automatically with the FastAPI app. If the broker is unreachable, the app falls back to standalone mode (camera streaming works normally without MQTT).
+
+- **Broker:** Mosquitto on Raspberry Pi 5 at `169.254.10.10:1883`
+- **Config:** `config/mqtt.yaml` (env-var overrides: `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT`)
+- **Windows fix:** The MQTT client runs in a dedicated thread with `asyncio.SelectorEventLoop` because Windows' default `ProactorEventLoop` doesn't support `add_reader`/`add_writer` (required by paho-mqtt)
+- **Auto-reconnect:** Exponential backoff (1s → 30s), infinite retries
+- **Health beacons:** Published every 2s to `health/win_controller` and `health/cameras/{id}`
+- **Connectivity DB:** SQLite at `data/connectivity.db` (24h rolling window)
+
+### New API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/mqtt/status` | GET | MQTT connection state, component health, sequence progress |
+| `/api/mqtt/connectivity` | GET | Detailed connectivity state for all components |
+| `/api/mqtt/sequence/start` | POST | Start a capture sequence (from YAML file or inline) |
+| `/api/mqtt/sequence/stop` | POST | Stop the active sequence |
+| `/api/mqtt/sequences` | GET | List available sequence YAML files |
+| `/api/mqtt/history/connectivity` | GET | Query connectivity history |
+| `/api/mqtt/history/alerts` | GET | Query alert history |

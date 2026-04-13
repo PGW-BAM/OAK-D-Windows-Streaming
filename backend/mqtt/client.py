@@ -1,9 +1,17 @@
-"""Reusable async MQTT client wrapper with auto-reconnect, LWT, and Pydantic serialization."""
+"""Reusable async MQTT client wrapper with auto-reconnect, LWT, and Pydantic serialization.
+
+On Windows, paho-mqtt requires a SelectorEventLoop (ProactorEventLoop doesn't
+support add_reader/add_writer).  This module runs the MQTT connection in a
+dedicated thread with its own SelectorEventLoop and bridges calls back to the
+main asyncio loop used by FastAPI/uvicorn.
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import platform
+import threading
 from typing import Any, Callable, Coroutine
 
 import aiomqtt
@@ -33,13 +41,19 @@ class MqttClient:
         self._cfg = mqtt_settings.broker
         self._handlers: list[tuple[str, MessageHandler]] = []
         self._client: aiomqtt.Client | None = None
-        self._task: asyncio.Task | None = None
-        self._connected = asyncio.Event()
+        self._connected_flag = threading.Event()
         self._stopping = False
+
+        # Dedicated event loop for the MQTT thread (SelectorEventLoop on Windows)
+        self._mqtt_loop: asyncio.AbstractEventLoop | None = None
+        self._mqtt_thread: threading.Thread | None = None
+
+        # Main loop reference for dispatching handlers
+        self._main_loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def is_connected(self) -> bool:
-        return self._connected.is_set()
+        return self._connected_flag.is_set()
 
     def on(self, topic_filter: str, handler: MessageHandler) -> None:
         """Register a handler for a topic pattern (supports + and # wildcards)."""
@@ -48,19 +62,27 @@ class MqttClient:
     async def start(self) -> None:
         """Start the MQTT client loop with auto-reconnect."""
         self._stopping = False
-        self._task = asyncio.create_task(self._run_loop(), name="mqtt-client")
+        self._main_loop = asyncio.get_running_loop()
+
+        # Create a dedicated SelectorEventLoop in a background thread
+        self._mqtt_loop = asyncio.SelectorEventLoop()
+        self._mqtt_thread = threading.Thread(
+            target=self._thread_entry, name="mqtt-thread", daemon=True
+        )
+        self._mqtt_thread.start()
 
     async def stop(self) -> None:
         """Gracefully shut down the client."""
         self._stopping = True
-        self._connected.clear()
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
+        self._connected_flag.clear()
+        if self._mqtt_loop and self._mqtt_loop.is_running():
+            self._mqtt_loop.call_soon_threadsafe(self._mqtt_loop.stop)
+        if self._mqtt_thread:
+            self._mqtt_thread.join(timeout=5)
+            self._mqtt_thread = None
+        if self._mqtt_loop and not self._mqtt_loop.is_closed():
+            self._mqtt_loop.close()
+            self._mqtt_loop = None
 
     async def publish(
         self,
@@ -77,27 +99,40 @@ class MqttClient:
         else:
             data = payload
 
-        if not self.is_connected or self._client is None:
+        if not self.is_connected or self._client is None or self._mqtt_loop is None:
             logger.debug("MQTT not connected — dropping publish to %s", topic)
             return
 
+        future = asyncio.run_coroutine_threadsafe(
+            self._do_publish(topic, data, qos, retain),
+            self._mqtt_loop,
+        )
         try:
-            await self._client.publish(topic, data, qos=qos, retain=retain)
-            logger.debug("PUB %s (qos=%d, retain=%s)", topic, qos, retain)
+            future.result(timeout=5.0)
         except Exception as exc:
             logger.error("MQTT publish error on %s: %s", topic, exc)
 
+    async def _do_publish(
+        self, topic: str, data: str, qos: int, retain: bool
+    ) -> None:
+        if self._client:
+            await self._client.publish(topic, data, qos=qos, retain=retain)
+            logger.debug("PUB %s (qos=%d, retain=%s)", topic, qos, retain)
+
     async def wait_connected(self, timeout: float = 10.0) -> bool:
         """Wait until connected or timeout. Returns True if connected."""
-        try:
-            await asyncio.wait_for(self._connected.wait(), timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
+        return await asyncio.get_event_loop().run_in_executor(
+            None, self._connected_flag.wait, timeout
+        )
 
     # ------------------------------------------------------------------
-    # Internal
+    # MQTT thread
     # ------------------------------------------------------------------
+
+    def _thread_entry(self) -> None:
+        """Entry point for the dedicated MQTT thread."""
+        asyncio.set_event_loop(self._mqtt_loop)
+        self._mqtt_loop.run_until_complete(self._run_loop())
 
     async def _run_loop(self) -> None:
         """Connection loop with exponential backoff reconnect."""
@@ -118,7 +153,7 @@ class MqttClient:
                     will=lwt,
                 ) as client:
                     self._client = client
-                    self._connected.set()
+                    self._connected_flag.set()
                     delay = self._cfg.reconnect_min_s
                     logger.info(
                         "MQTT connected to %s:%d", self._cfg.host, self._cfg.port
@@ -142,20 +177,17 @@ class MqttClient:
                             logger.warning("Non-JSON message on %s", topic_str)
                             continue
 
+                        # Dispatch to handlers on the main event loop
                         for topic_filter, handler in self._handlers:
                             if _topic_matches(topic_filter, topic_str):
-                                try:
-                                    await handler(topic_str, payload_dict)
-                                except Exception as exc:
-                                    logger.error(
-                                        "Handler error for %s: %s",
-                                        topic_str,
-                                        exc,
-                                        exc_info=True,
+                                if self._main_loop and not self._main_loop.is_closed():
+                                    asyncio.run_coroutine_threadsafe(
+                                        _safe_call(handler, topic_str, payload_dict),
+                                        self._main_loop,
                                     )
 
             except aiomqtt.MqttError as exc:
-                self._connected.clear()
+                self._connected_flag.clear()
                 self._client = None
                 if self._stopping:
                     break
@@ -165,21 +197,30 @@ class MqttClient:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self._cfg.reconnect_max_s)
 
-            except asyncio.CancelledError:
-                break
-
             except Exception as exc:
-                self._connected.clear()
+                self._connected_flag.clear()
                 self._client = None
                 if self._stopping:
                     break
-                logger.error("MQTT unexpected error: %s — reconnecting in %.1fs", exc, delay)
+                logger.error(
+                    "MQTT unexpected error: %s — reconnecting in %.1fs", exc, delay
+                )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self._cfg.reconnect_max_s)
 
-        self._connected.clear()
+        self._connected_flag.clear()
         self._client = None
         logger.info("MQTT client stopped")
+
+
+async def _safe_call(
+    handler: MessageHandler, topic: str, data: dict[str, Any]
+) -> None:
+    """Call a handler with exception logging."""
+    try:
+        await handler(topic, data)
+    except Exception as exc:
+        logger.error("Handler error for %s: %s", topic, exc, exc_info=True)
 
 
 def _topic_matches(filter_pattern: str, topic: str) -> bool:

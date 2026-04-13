@@ -2,7 +2,7 @@
 # Env-var overrides: MQTT_BROKER_HOST, MQTT_BROKER_PORT, OAK_ALERT_EMAIL, OAK_SMTP_HOST, OAK_SMTP_PASSWORD
 
 broker:
-  host: "192.168.1.100"          # Raspberry Pi IP address
+  host: "169.254.10.10"           # Raspberry Pi static IP on PoE switch LAN
   port: 1883
   keepalive: 30
   clean_session: false

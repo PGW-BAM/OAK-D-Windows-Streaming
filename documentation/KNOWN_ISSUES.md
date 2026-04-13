@@ -78,20 +78,35 @@ Windows Firewall may block UDP broadcast (device discovery) and TCP data. The us
 
 ---
 
+## MQTT Integration Issues
+
+### 9. Windows asyncio event loop compatibility
+Windows' default `ProactorEventLoop` doesn't support `add_reader`/`add_writer` required by paho-mqtt. **Fixed:** The MQTT client runs in a dedicated thread with `asyncio.SelectorEventLoop`. Edge case: if the MQTT thread crashes, it won't auto-restart until the app is restarted.
+
+### 10. MQTT sequences vs. existing interval recording
+When an MQTT capture sequence is running, the orchestrator calls `capture_snapshot()` at specific drive positions. If interval recording is also active, both systems capture independently. There is no coordination between them — the operator should stop interval recording before starting a sequence.
+
+### 11. Email alert delivery depends on SMTP configuration
+If `config/mqtt.yaml` has no SMTP settings, alerts are only logged to SQLite and `logs/unsent_alerts.jsonl`. The first-run email prompt described in the PRD is not yet implemented — the operator must edit `config/mqtt.yaml` manually.
+
+### 12. cam_id mapping is positional
+The orchestrator maps `cam1` → first discovered camera, `cam2` → second. If cameras are discovered in a different order across restarts, the mapping may change. A future fix should map by serial number or IP in config.
+
+---
+
 ## Suggested Next Steps (Priority Order)
 
-1. **Test with real hardware** — connect a PoE OAK-D 4 Pro, run `start.bat`, click "Discover cameras"
+1. **Implement Pi drive controller** — GPIO stepper control + MQTT client (see `docs/RASPBERRY_PI_IMPLEMENTATION.md`)
 2. **Fix on-camera inference model path** (Issue #1 above)
-3. **Fix frame dimensions** (Issue #2) — needed for correct detection overlay scaling
-4. **Add auto-reconnect** (Issue #5)
-5. **Move host inference off frame thread** (Issue #6) — important for multi-camera + GPU
+3. **Add auto-reconnect for cameras** (Issue #5)
+4. **Add cam_id mapping by serial number** (Issue #12) — stable camera identification
+5. **Move host inference off frame thread** (Issue #6)
 6. **Persist layout to localStorage** (Issue #4)
-7. **Add depth stream support** — second pipeline output for `StereoDepth` node, serve as 16-bit PNG
-8. **Add stereo cameras** — `CAM_B` and `CAM_C` mono cameras for depth
+7. **Add streaming overlay** — render connectivity status onto camera preview (Phase 2)
+8. **Add first-run email prompt** (Issue #11)
 9. **Add snapshot download button** in `CameraCard`
 10. **Add recordings browser** — list files in `recordings/` via new API endpoint
-11. **Add per-camera name editing** — store in a config file, display in UI
-12. **Consider WebRTC upgrade path** — for >4 cameras at 1080p where MJPEG bandwidth becomes limiting
+11. **Consider WebRTC upgrade path** — for >4 cameras at 1080p where MJPEG bandwidth becomes limiting
 
 ---
 
