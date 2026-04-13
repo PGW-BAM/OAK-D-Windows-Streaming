@@ -78,7 +78,7 @@ class MqttClient:
             data = payload
 
         if not self.is_connected or self._client is None:
-            logger.warning("MQTT not connected — dropping publish to %s", topic)
+            logger.debug("MQTT not connected — dropping publish to %s", topic)
             return
 
         try:
