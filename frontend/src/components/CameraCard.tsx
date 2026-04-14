@@ -100,6 +100,49 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
                 height={imgSize.h}
               />
             )}
+            {/* Recording overlay — visible on the stream so it can't be missed */}
+            {camera.recording && (
+              <div style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                padding: '6px 10px',
+                background: 'rgba(120,0,0,0.75)',
+                backdropFilter: 'blur(4px)',
+              }}>
+                <span style={{
+                  color: '#ff4444',
+                  fontSize: 12,
+                  fontFamily: 'monospace',
+                  fontWeight: 700,
+                  animation: 'recBlink 1.2s step-start infinite',
+                }}>
+                  {camera.recording_mode === 'video' ? '⏺ REC' : '📷 INT'}
+                </span>
+                <button
+                  onClick={handleStopRecording}
+                  disabled={stopping}
+                  style={{
+                    marginLeft: 'auto',
+                    padding: '3px 12px',
+                    background: stopping ? '#555' : '#cc2222',
+                    border: 'none',
+                    borderRadius: 4,
+                    color: '#fff',
+                    cursor: stopping ? 'default' : 'pointer',
+                    fontSize: 12,
+                    fontFamily: 'monospace',
+                    fontWeight: 700,
+                  }}
+                >
+                  {stopping ? 'Stopping…' : '■ Stop'}
+                </button>
+              </div>
+            )}
           </>
         ) : (
           <div
@@ -115,6 +158,26 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
               gap: 6,
             }}
           >
+            {camera.recording && (
+              <button
+                onClick={handleStopRecording}
+                disabled={stopping}
+                style={{
+                  marginBottom: 6,
+                  padding: '5px 16px',
+                  background: stopping ? '#555' : '#cc2222',
+                  border: 'none',
+                  borderRadius: 4,
+                  color: '#fff',
+                  cursor: stopping ? 'default' : 'pointer',
+                  fontSize: 13,
+                  fontFamily: 'monospace',
+                  fontWeight: 700,
+                }}
+              >
+                {stopping ? 'Stopping…' : `■ Stop ${camera.recording_mode === 'video' ? 'video' : 'interval'}`}
+              </button>
+            )}
             {!camera.enabled ? (
               <>
                 <span style={{ fontSize: 24, opacity: 0.4 }}>⏻</span>
@@ -183,26 +246,6 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
 
         {/* Controls (right-aligned) */}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
-          {camera.recording && (
-            <button
-              onClick={handleStopRecording}
-              disabled={stopping}
-              title="Stop recording"
-              style={{
-                background: '#883333',
-                border: 'none',
-                borderRadius: 3,
-                color: '#fff',
-                cursor: stopping ? 'default' : 'pointer',
-                fontSize: 10,
-                fontWeight: 700,
-                opacity: stopping ? 0.6 : 1,
-                padding: '2px 6px',
-              }}
-            >
-              ■ Stop
-            </button>
-          )}
           <button
             onClick={toggleEnabled}
             disabled={toggling}
