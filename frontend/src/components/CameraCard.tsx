@@ -1,6 +1,6 @@
 import { useRef, useState, useEffect } from 'react'
 import { DetectionOverlay } from './DetectionOverlay'
-import { enableCamera, disableCamera, useDetections, useStreamUrl } from '../hooks/useCamera'
+import { enableCamera, disableCamera, stopRecording, useDetections, useStreamUrl } from '../hooks/useCamera'
 import type { CameraStatus } from '../types'
 
 interface Props {
@@ -20,6 +20,7 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
   const [imgError, setImgError] = useState(false)
   const [reconnectKey, setReconnectKey] = useState(0)
   const [toggling, setToggling] = useState(false)
+  const [stopping, setStopping] = useState(false)
 
   // Auto-reconnect: when the MJPEG stream breaks (e.g. because the backend was
   // briefly blocked restarting a pipeline), wait 3 s then force a new <img>
@@ -37,6 +38,16 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
     if (imgRef.current) {
       setImgSize({ w: imgRef.current.offsetWidth, h: imgRef.current.offsetHeight })
       setImgError(false)
+    }
+  }
+
+  const handleStopRecording = async () => {
+    setStopping(true)
+    try {
+      await stopRecording(camera.id)
+      onRefresh()
+    } finally {
+      setStopping(false)
     }
   }
 
@@ -172,6 +183,26 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
 
         {/* Controls (right-aligned) */}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+          {camera.recording && (
+            <button
+              onClick={handleStopRecording}
+              disabled={stopping}
+              title="Stop recording"
+              style={{
+                background: '#883333',
+                border: 'none',
+                borderRadius: 3,
+                color: '#fff',
+                cursor: stopping ? 'default' : 'pointer',
+                fontSize: 10,
+                fontWeight: 700,
+                opacity: stopping ? 0.6 : 1,
+                padding: '2px 6px',
+              }}
+            >
+              ■ Stop
+            </button>
+          )}
           <button
             onClick={toggleEnabled}
             disabled={toggling}

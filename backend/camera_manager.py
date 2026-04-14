@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -60,6 +61,28 @@ class FrameBuffer:
 
 
 @dataclass
+class ImuBuffer:
+    """Lock-protected buffer for the latest IMU angle reading."""
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _roll_deg: float = 0.0
+    _pitch_deg: float = 0.0
+    _timestamp: float = 0.0
+    _has_data: bool = False
+
+    def put(self, roll_deg: float, pitch_deg: float) -> None:
+        with self._lock:
+            self._roll_deg = roll_deg
+            self._pitch_deg = pitch_deg
+            self._timestamp = time.monotonic()
+            self._has_data = True
+
+    def get(self) -> tuple[float, float, bool]:
+        """Returns (roll_deg, pitch_deg, has_data)."""
+        with self._lock:
+            return self._roll_deg, self._pitch_deg, self._has_data
+
+
+@dataclass
 class DetectionBuffer:
     """Lock-protected latest detection result buffer."""
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -87,6 +110,7 @@ class CameraWorker:
         self.left_frame_buffer = FrameBuffer()
         self.right_frame_buffer = FrameBuffer()
         self.detection_buffer = DetectionBuffer()
+        self.imu_buffer = ImuBuffer()
 
         self._device: Optional[dai.Device] = None
         self._pipeline: Optional[dai.Pipeline] = None
@@ -121,6 +145,7 @@ class CameraWorker:
         self._left_mjpeg_queue: Optional[dai.MessageQueue] = None
         self._right_mjpeg_queue: Optional[dai.MessageQueue] = None
         self._det_queue: Optional[dai.MessageQueue] = None
+        self._imu_queue: Optional[dai.MessageQueue] = None
         self._control_input: Optional[dai.InputQueue] = None
 
         # Host-side YOLO (lazy import)
@@ -144,7 +169,17 @@ class CameraWorker:
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            # High-bandwidth pipelines (4K+60fps) can take several seconds to
+            # wind down cleanly via pipeline.stop() / device.close().  5 s was
+            # too short and left the device open when the next camera tried to
+            # start.  30 s is a safe upper bound.
+            self._thread.join(timeout=30)
+            if self._thread.is_alive():
+                logger.warning(
+                    "Camera %s worker thread did not stop within 30 s "
+                    "— device may still be open",
+                    self.id,
+                )
         self._connected = False
 
     def _build_pipeline(self, device: dai.Device) -> dai.Pipeline:

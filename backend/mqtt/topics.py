@@ -77,9 +77,24 @@ class Topics:
     def config_sequence_active() -> str:
         return "config/sequence/active"
 
+    # ── IMU / Drift Detection ─────────────────────────────────────────
+
+    @staticmethod
+    def telemetry_imu(cam_id: str) -> str:
+        return f"telemetry/cam/{cam_id}/imu"
+
+    @staticmethod
+    def cmd_imu_check(cam_id: str) -> str:
+        return f"cmd/cam/{cam_id}/imu_check"
+
+    @staticmethod
+    def event_drift(cam_id: str, axis: str = "b") -> str:
+        return f"event/drift/{cam_id}/{axis}"
+
     # ── Wildcard subscriptions ────────────────────────────────────────
 
     CMD_DRIVES_ALL = "cmd/drives/+/#"
     STATUS_DRIVES_ALL = "status/drives/+/position"
     HEALTH_ALL = "health/#"
     ERROR_ALL = "error/#"
+    CMD_IMU_CHECK_ALL = "cmd/cam/+/imu_check"

@@ -144,6 +144,24 @@ async def enable_camera(camera_id: str) -> ApiResponse:
         worker = camera_manager.get_worker(camera_id)
     except KeyError:
         raise HTTPException(404, f"Camera {camera_id!r} not found")
+
+    # Wait for any other camera that is currently in the process of stopping
+    # (disabled but whose worker thread hasn't exited yet) to fully release its
+    # PoE device before we open a new pipeline.  Without this, switching from a
+    # high-bandwidth camera (e.g. 4K+60fps ≈ 87% PoE) to another while the
+    # first is still winding down pushes combined bandwidth over 100%.
+    stopping = [
+        w for w in camera_manager.all_workers()
+        if w.id != camera_id and not w._enabled
+        and w._thread is not None and w._thread.is_alive()
+    ]
+    if stopping:
+        def _drain() -> None:
+            for w in stopping:
+                if w._thread:
+                    w._thread.join(timeout=30)
+        await asyncio.to_thread(_drain)
+
     worker.set_enabled(True)
     return ApiResponse(ok=True, message="Camera enabled")
 

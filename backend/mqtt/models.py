@@ -24,6 +24,7 @@ class MoveCommand(BaseModel):
     drive_axis: Literal["a", "b"]
     target_position: float
     speed: float = 1.0
+    checkpoint_name: str | None = None  # if set, Pi runs IMU drift check after settling
     timestamp: datetime = Field(default_factory=_now)
 
 
@@ -154,4 +155,38 @@ class AlertEvent(BaseModel):
     component: str
     message: str
     system_state: ConnectivityState | None = None
+    timestamp: datetime = Field(default_factory=_now)
+
+
+# ── IMU / Drift Detection ─────────────────────────────────────────────────
+
+
+class IMUAngle(BaseModel):
+    """Published by Windows continuously (~2 Hz) and in response to IMUCheckRequest."""
+    cam_id: str
+    roll_deg: float
+    pitch_deg: float
+    request_id: str | None = None  # echoed from IMUCheckRequest; None for background publishes
+    timestamp: datetime = Field(default_factory=_now)
+
+
+class IMUCheckRequest(BaseModel):
+    """Received from Pi requesting a fresh IMU reading at a checkpoint."""
+    request_id: str  # uuid4 — must be echoed back in the IMUAngle response
+    cam_id: str
+    checkpoint_name: str
+    timestamp: datetime = Field(default_factory=_now)
+
+
+class DriftDetectionEvent(BaseModel):
+    """Published by Pi when drive drift is detected and a correction is applied."""
+    request_id: str
+    cam_id: str
+    drive_axis: Literal["a", "b"]
+    checkpoint_name: str
+    expected_angle_deg: float
+    actual_angle_deg: float
+    drift_deg: float
+    correction_steps: int
+    corrected: bool
     timestamp: datetime = Field(default_factory=_now)
