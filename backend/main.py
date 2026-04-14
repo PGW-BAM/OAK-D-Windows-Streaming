@@ -154,7 +154,8 @@ async def disable_camera(camera_id: str) -> ApiResponse:
         worker = camera_manager.get_worker(camera_id)
     except KeyError:
         raise HTTPException(404, f"Camera {camera_id!r} not found")
-    worker.set_enabled(False)
+    # set_enabled(False) calls thread.join() — offload so the event loop stays live
+    await asyncio.to_thread(worker.set_enabled, False)
     return ApiResponse(ok=True, message="Camera disabled — bandwidth freed")
 
 
@@ -275,7 +276,9 @@ async def update_stream_settings(camera_id: str, req: StreamSettingsRequest) -> 
     except KeyError:
         raise HTTPException(404, f"Camera {camera_id!r} not found")
     try:
-        worker.update_stream_settings(req)
+        # update_stream_settings calls stop() → thread.join() — offload so the
+        # event loop keeps serving the concurrent camera's MJPEG stream
+        await asyncio.to_thread(worker.update_stream_settings, req)
     except Exception as exc:
         raise HTTPException(500, str(exc))
     return ApiResponse(ok=True, message="Stream settings updated")
@@ -287,7 +290,7 @@ async def update_stream_settings_all(req: StreamSettingsRequest) -> ApiResponse:
     errors = []
     for worker in camera_manager.all_workers():
         try:
-            worker.update_stream_settings(req)
+            await asyncio.to_thread(worker.update_stream_settings, req)
         except Exception as exc:
             errors.append(f"{worker.id[:8]}: {exc}")
     if errors:
@@ -330,12 +333,20 @@ async def start_recording(camera_id: str, req: RecordingStartRequest) -> ApiResp
     worker._recording = True
     worker._recording_mode = req.mode
 
-    output_path = rec_worker.start(
-        req.mode, req.interval_seconds,
-        output_dir=custom_dir,
-        filename_prefix=req.filename_prefix,
-        stereo_capture=stereo_capture,
-    )
+    try:
+        output_path = rec_worker.start(
+            req.mode, req.interval_seconds,
+            output_dir=custom_dir,
+            filename_prefix=req.filename_prefix,
+            stereo_capture=stereo_capture,
+            fps=worker._stream_fps,
+        )
+    except Exception as exc:
+        # Roll back recording state so the camera worker doesn't feed a broken recorder
+        worker._recording = False
+        worker._recording_mode = None
+        worker.recording_worker = None
+        raise HTTPException(500, f"Failed to start recording: {exc}") from exc
     return ApiResponse(ok=True, message="Recording started", data=str(output_path))
 
 
@@ -382,12 +393,19 @@ async def start_recording_all(req: RecordingStartRequest) -> ApiResponse:
             worker._recording = True
             worker._recording_mode = req.mode
 
-            rec_worker.start(
-                req.mode, req.interval_seconds,
-                output_dir=custom_dir,
-                filename_prefix=req.filename_prefix,
-                stereo_capture=stereo_capture,
-            )
+            try:
+                rec_worker.start(
+                    req.mode, req.interval_seconds,
+                    output_dir=custom_dir,
+                    filename_prefix=req.filename_prefix,
+                    stereo_capture=stereo_capture,
+                    fps=worker._stream_fps,
+                )
+            except Exception as exc:
+                worker._recording = False
+                worker._recording_mode = None
+                worker.recording_worker = None
+                raise
             started.append(worker.id[:8])
         except Exception as exc:
             errors.append(f"{worker.id[:8]}: {exc}")
@@ -434,7 +452,8 @@ async def set_inference_mode(camera_id: str, req: InferenceModeRequest) -> ApiRe
     except KeyError:
         raise HTTPException(404, f"Camera {camera_id!r} not found")
     try:
-        worker.set_inference_mode(req.mode, req.model_path)
+        # on_camera mode triggers a pipeline rebuild (stop+start) — offload to thread
+        await asyncio.to_thread(worker.set_inference_mode, req.mode, req.model_path)
     except RuntimeError as exc:
         raise HTTPException(500, str(exc))
     return ApiResponse(ok=True, message=f"Inference mode set to {req.mode}")

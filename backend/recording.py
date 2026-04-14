@@ -197,23 +197,25 @@ class RecordingWorker:
         output_dir: Path | None = None,
         filename_prefix: str = "",
         stereo_capture: bool = False,
+        fps: int | None = None,
     ) -> Path:
         self.stop()  # ensure clean state
         self._mode = mode
+        effective_fps = fps if fps is not None else settings.stream_fps
         if mode == RecordingMode.video:
             self._video = VideoRecorder(
-                self.camera_id, fps=settings.stream_fps,
+                self.camera_id, fps=effective_fps,
                 output_dir=output_dir, prefix=filename_prefix,
             )
             path = self._video.start()
             if stereo_capture:
                 self._video_left = VideoRecorder(
-                    self.camera_id, fps=settings.stream_fps,
+                    self.camera_id, fps=effective_fps,
                     output_dir=output_dir, prefix=filename_prefix, suffix="left",
                 )
                 self._video_left.start()
                 self._video_right = VideoRecorder(
-                    self.camera_id, fps=settings.stream_fps,
+                    self.camera_id, fps=effective_fps,
                     output_dir=output_dir, prefix=filename_prefix, suffix="right",
                 )
                 self._video_right.start()

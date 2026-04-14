@@ -218,11 +218,12 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
         await startRecordingAll(mode, intervalSecs, customDir, filenamePrefix)
         flash(`${mode === 'video' ? 'Video' : 'Interval'} recording started on all cameras`)
       } else {
-        await startRecording(camera.id, mode, intervalSecs, customDir, filenamePrefix)
-        flash(`${mode === 'video' ? 'Video' : 'Interval'} recording started`)
+        const result = await startRecording(camera.id, mode, intervalSecs, customDir, filenamePrefix)
+        const savePath = result?.data
+        flash(`${mode === 'video' ? 'Video' : 'Interval'} recording started — saving to: ${savePath ?? outputDir}`)
       }
       onRefresh()
-    } catch { flash('Error starting recording') }
+    } catch (err) { flash(`Error starting recording: ${err instanceof Error ? err.message : 'unknown error'}`) }
     finally { setBusy(false) }
   }
 

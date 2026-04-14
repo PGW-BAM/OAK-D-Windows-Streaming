@@ -100,7 +100,7 @@ export async function startRecording(
   intervalSeconds = 5,
   outputDir?: string,
   filenamePrefix?: string,
-) {
+): Promise<{ ok: boolean; message: string; data?: string }> {
   const res = await fetch(`${API}/camera/${cameraId}/recording/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -111,6 +111,10 @@ export async function startRecording(
       filename_prefix: filenamePrefix || '',
     }),
   })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ message: res.statusText }))
+    throw new Error(body?.detail ?? body?.message ?? res.statusText)
+  }
   return res.json()
 }
 
