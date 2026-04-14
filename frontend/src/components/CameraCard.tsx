@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useRef, useState, useEffect } from 'react'
 import { DetectionOverlay } from './DetectionOverlay'
 import { enableCamera, disableCamera, useDetections, useStreamUrl } from '../hooks/useCamera'
 import type { CameraStatus } from '../types'
@@ -18,7 +18,20 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
   const imgRef = useRef<HTMLImageElement>(null)
   const [imgSize, setImgSize] = useState({ w: 0, h: 0 })
   const [imgError, setImgError] = useState(false)
+  const [reconnectKey, setReconnectKey] = useState(0)
   const [toggling, setToggling] = useState(false)
+
+  // Auto-reconnect: when the MJPEG stream breaks (e.g. because the backend was
+  // briefly blocked restarting a pipeline), wait 3 s then force a new <img>
+  // mount so the browser opens a fresh HTTP connection.
+  useEffect(() => {
+    if (!imgError) return
+    const t = setTimeout(() => {
+      setImgError(false)
+      setReconnectKey(k => k + 1)
+    }, 3000)
+    return () => clearTimeout(t)
+  }, [imgError])
 
   const onLoad = () => {
     if (imgRef.current) {
@@ -61,6 +74,7 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
         {camera.enabled && camera.connected && !imgError ? (
           <>
             <img
+              key={reconnectKey}
               ref={imgRef}
               src={streamUrl}
               onLoad={onLoad}
