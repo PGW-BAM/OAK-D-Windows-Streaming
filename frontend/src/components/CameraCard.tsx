@@ -137,7 +137,8 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
         <span style={{ color: statusColor, fontSize: 8 }}>●</span>
         <span style={{ fontWeight: 700, color: '#eee' }}>{camera.name}</span>
         {camera.ip && <span style={{ color: '#888' }}>{camera.ip}</span>}
-        <span>{camera.fps} fps</span>
+        <span>{camera.stream_fps} fps</span>
+        {camera.resolution && <span style={{ color: '#888' }}>{camera.resolution}</span>}
         {camera.latency_ms > 0 && <span>{camera.latency_ms} ms</span>}
         {camera.recording && (
           <span style={{ color: '#ff4444' }}>
