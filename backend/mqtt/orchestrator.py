@@ -29,6 +29,7 @@ from .models import (
 from .topics import Topics
 
 if TYPE_CHECKING:
+    from backend.angle_targets import AngleTargetManager
     from backend.camera_manager import CameraManager
 
 logger = logging.getLogger(__name__)
@@ -50,9 +51,11 @@ class SequenceRunner:
         self,
         mqtt: MqttClient,
         camera_manager: CameraManager,
+        angle_targets: AngleTargetManager | None = None,
     ) -> None:
         self._mqtt = mqtt
         self._camera_manager = camera_manager
+        self._angle_targets = angle_targets
         self._cfg = mqtt_settings.orchestration
 
         # Current state
@@ -95,6 +98,15 @@ class SequenceRunner:
             # Signal waiters if drive reached target
             if pos.state == "reached" and key in self._position_events:
                 self._position_events[key].set()
+
+    def get_drive_positions(self, cam_id: str) -> dict[str, float | None]:
+        """Return the latest cached drive positions for a camera (non-blocking)."""
+        pos_a = self._drive_positions.get(f"{cam_id}:a")
+        pos_b = self._drive_positions.get(f"{cam_id}:b")
+        return {
+            "drive_a": pos_a.current_position if pos_a else None,
+            "drive_b": pos_b.current_position if pos_b else None,
+        }
 
     async def load_sequence_file(self, path: str | Path) -> CaptureSequence:
         """Load a capture sequence from a YAML file."""
@@ -226,12 +238,34 @@ class SequenceRunner:
             sequence_id=seq_id,
             drive_axis="a",
             target_position=step.position.drive_a,
+            checkpoint_name=step.checkpoint_name,
         )
         move_b = MoveCommand(
             sequence_id=seq_id,
             drive_axis="b",
             target_position=step.position.drive_b,
+            checkpoint_name=step.checkpoint_name,
         )
+
+        # Closed-loop angle injection: if the operator taught a target angle for
+        # this checkpoint on axis b, override target_position with the taught
+        # motor position and add the angle fields so the Pi runs converge().
+        if step.checkpoint_name and self._angle_targets is not None:
+            taught = self._angle_targets.get(cam_id, step.checkpoint_name)
+            if taught is not None and taught.axis == "b":
+                move_b.target_position = taught.motor_position
+                move_b.target_angle_deg = taught.target_angle_deg
+                move_b.active_angle = taught.active_angle
+                move_b.resync_position = taught.motor_position
+                logger.info(
+                    "Orchestrator injecting taught angle target for %s/%s: "
+                    "target_angle_deg=%.3f motor_position=%.1f active=%s",
+                    cam_id,
+                    step.checkpoint_name,
+                    taught.target_angle_deg,
+                    taught.motor_position,
+                    taught.active_angle,
+                )
 
         await self._mqtt.publish(Topics.cmd_move(cam_id), move_a)
         await self._mqtt.publish(Topics.cmd_move(cam_id), move_b)

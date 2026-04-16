@@ -97,6 +97,13 @@ class DetectionBuffer:
             return self._detection
 
 
+def _compute_imu_angles(ax: float, ay: float, az: float) -> tuple[float, float]:
+    """Compute roll and pitch in degrees from raw accelerometer data."""
+    roll_rad = math.atan2(ay, az)
+    pitch_rad = math.atan2(-ax, math.sqrt(ay ** 2 + az ** 2))
+    return math.degrees(roll_rad), math.degrees(pitch_rad)
+
+
 class CameraWorker:
     """Manages one OAK device: pipeline, frame acquisition, control, recording."""
 
@@ -131,6 +138,7 @@ class CameraWorker:
         self._mjpeg_quality: int = settings.mjpeg_quality
         self._resolution: str = "720p"
         self._stereo_mode: StereoMode = StereoMode.main_only
+        self._flip_180: bool = False  # Rotate 180° for ceiling-mounted cameras
 
         # FPS tracking
         self._fps: float = 0.0
@@ -147,6 +155,11 @@ class CameraWorker:
         self._det_queue: Optional[dai.MessageQueue] = None
         self._imu_queue: Optional[dai.MessageQueue] = None
         self._control_input: Optional[dai.InputQueue] = None
+
+        # Remember the last control the user/calibration applied so we can
+        # re-assert focus/exposure/WB after pipeline rebuilds — otherwise the
+        # OAK-D defaults back to continuous autofocus on every restart.
+        self._last_control: Optional[CameraControlRequest] = None
 
         # Host-side YOLO (lazy import)
         self._host_model = None
@@ -279,50 +292,119 @@ class CameraWorker:
             self._left_mjpeg_queue = None
             self._right_mjpeg_queue = None
 
+        # --- IMU (accelerometer for drift detection) ---
+        try:
+            imu = pipeline.create(dai.node.IMU)
+            imu.enableIMUSensor(dai.IMUSensor.ACCELEROMETER_RAW, 10)  # 10 Hz — sufficient for angle estimation
+            imu.setBatchReportThreshold(5)   # report every 5 samples → 2 Hz host delivery
+            imu.setMaxBatchReports(10)
+            self._imu_queue = imu.out.createOutputQueue()
+            self._imu_queue.setMaxSize(4)
+            self._imu_queue.setBlocking(False)
+            logger.debug("IMU node enabled for %s", self.id)
+        except Exception as exc:
+            logger.warning("Could not enable IMU on %s: %s", self.id, exc)
+            self._imu_queue = None
+
         return pipeline
 
     def _run(self) -> None:
         logger.info("Camera worker starting: %s", self.id)
-        device: Optional[dai.Device] = None
-        pipeline: Optional[dai.Pipeline] = None
-        try:
-            device = dai.Device(self.device_info)
-            self._device = device
-            self._connected = True
+        _MAX_RETRIES = 10
+        _RETRY_DELAYS = [2, 4, 8, 16, 30, 30, 30, 30, 30, 30]  # seconds, one per retry
 
-            # Get device IP
+        for attempt in range(_MAX_RETRIES + 1):
+            if self._stop_event.is_set():
+                break
+
+            device: Optional[dai.Device] = None
+            pipeline: Optional[dai.Pipeline] = None
+
+            # Reset per-pipeline state so stale queue handles are never used
+            self._mjpeg_queue = None
+            self._left_mjpeg_queue = None
+            self._right_mjpeg_queue = None
+            self._det_queue = None
+            self._imu_queue = None
+            self._control_input = None
+            self._frame_width = 0
+            self._frame_height = 0
+            self._fps_counter = 0
+
             try:
-                self.ip = device.getDeviceInfo().name
-            except Exception:
-                pass
+                device = dai.Device(self.device_info)
+                self._device = device
+                self._connected = True
 
-            pipeline = self._build_pipeline(device)
-            pipeline.start()
-
-            logger.info("Camera %s connected (IP: %s)", self.id, self.ip)
-            self._fps_last_time = time.monotonic()
-
-            while not self._stop_event.is_set():
-                self._process_frame()
-                self._process_stereo_frames()
-                self._process_detections()
-
-        except Exception as exc:
-            logger.error("Camera %s error: %s", self.id, exc, exc_info=True)
-        finally:
-            if pipeline:
                 try:
-                    pipeline.stop()
+                    self.ip = device.getDeviceInfo().name
                 except Exception:
                     pass
-            if device:
-                try:
-                    device.close()
-                except Exception:
-                    pass
-            self._device = None
-            self._connected = False
-            logger.info("Camera worker stopped: %s", self.id)
+
+                pipeline = self._build_pipeline(device)
+                pipeline.start()
+
+                logger.info(
+                    "Camera %s connected (IP: %s)%s",
+                    self.id, self.ip,
+                    f" [retry {attempt}]" if attempt else "",
+                )
+                self._fps_last_time = time.monotonic()
+
+                # Re-assert the last-applied control so focus/exposure/WB survive
+                # pipeline rebuilds. Without this, the OAK-D defaults back to
+                # continuous autofocus after every stream-settings change.
+                if self._last_control is not None and self._control_input is not None:
+                    try:
+                        self.apply_control(self._last_control)
+                    except Exception as exc:
+                        logger.debug(
+                            "Camera %s: failed to re-assert last control after restart: %s",
+                            self.id[:8], exc,
+                        )
+
+                while not self._stop_event.is_set():
+                    self._process_frame()
+                    self._process_stereo_frames()
+                    self._process_detections()
+                    self._process_imu()
+
+                # Clean exit — stop_event was set explicitly (disable/shutdown)
+                break
+
+            except Exception as exc:
+                if self._stop_event.is_set():
+                    break
+                if attempt < _MAX_RETRIES:
+                    delay = _RETRY_DELAYS[attempt]
+                    logger.warning(
+                        "Camera %s pipeline error (attempt %d/%d, retrying in %ds): %s",
+                        self.id, attempt + 1, _MAX_RETRIES + 1, delay, exc,
+                    )
+                else:
+                    logger.error(
+                        "Camera %s pipeline error — max retries reached, giving up: %s",
+                        self.id, exc, exc_info=True,
+                    )
+            finally:
+                self._connected = False
+                if pipeline:
+                    try:
+                        pipeline.stop()
+                    except Exception:
+                        pass
+                if device:
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+                self._device = None
+
+            # Interruptible delay before next attempt
+            if attempt < _MAX_RETRIES and not self._stop_event.is_set():
+                self._stop_event.wait(timeout=_RETRY_DELAYS[attempt])
+
+        logger.info("Camera worker stopped: %s", self.id)
 
     def _process_frame(self) -> None:
         if self._mjpeg_queue is None:
@@ -333,6 +415,23 @@ class CameraWorker:
                 time.sleep(0.001)
                 return
             data = bytes(pkt.getData())
+
+            # Rotate 180° for ceiling-mounted cameras
+            if self._flip_180:
+                try:
+                    import cv2
+                    arr = np.frombuffer(data, dtype=np.uint8)
+                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if img is not None:
+                        img = cv2.rotate(img, cv2.ROTATE_180)
+                        _, buf = cv2.imencode(
+                            '.jpg', img,
+                            [cv2.IMWRITE_JPEG_QUALITY, self._mjpeg_quality],
+                        )
+                        data = buf.tobytes()
+                except Exception as exc:
+                    logger.debug("Rotation error on %s: %s", self.id, exc)
+
             self.frame_buffer.put(data)
 
             # Detect frame dimensions once from JPEG header
@@ -389,6 +488,23 @@ class CameraWorker:
                 if pkt is None:
                     continue
                 data = bytes(pkt.getData())
+
+                # Rotate 180° for ceiling-mounted cameras
+                if self._flip_180:
+                    try:
+                        import cv2
+                        arr = np.frombuffer(data, dtype=np.uint8)
+                        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                        if img is not None:
+                            img = cv2.rotate(img, cv2.ROTATE_180)
+                            _, enc = cv2.imencode(
+                                '.jpg', img,
+                                [cv2.IMWRITE_JPEG_QUALITY, self._mjpeg_quality],
+                            )
+                            data = enc.tobytes()
+                    except Exception as exc:
+                        logger.debug("Stereo rotation error on %s/%s: %s", self.id, side, exc)
+
                 buf.put(data)
                 # Feed stereo to recording worker
                 if self.recording_worker and self._recording:
@@ -428,6 +544,26 @@ class CameraWorker:
             self.detection_buffer.put(detection)
         except Exception as exc:
             logger.debug("Detection processing error on %s: %s", self.id, exc)
+
+    def _process_imu(self) -> None:
+        """Drain the IMU queue and update imu_buffer with the latest angles."""
+        if self._imu_queue is None:
+            return
+        try:
+            imu_data = self._imu_queue.tryGet()
+            if imu_data is None:
+                return
+            for packet in imu_data.packets:
+                accel = packet.acceleroMeter
+                roll_deg, pitch_deg = _compute_imu_angles(accel.x, accel.y, accel.z)
+                self.imu_buffer.put(roll_deg, pitch_deg)
+        except Exception as exc:
+            logger.debug("IMU processing error on %s: %s", self.id, exc)
+
+    def get_imu_angle(self) -> tuple[float, float] | None:
+        """Return (roll_deg, pitch_deg) from the latest IMU reading, or None if no data."""
+        roll, pitch, has_data = self.imu_buffer.get()
+        return (roll, pitch) if has_data else None
 
     def _run_host_inference(self, jpeg_bytes: bytes) -> None:
         try:
@@ -503,6 +639,7 @@ class CameraWorker:
             ctrl.setChromaDenoise(req.chroma_denoise)
 
         self._control_input.send(ctrl)
+        self._last_control = req
 
     def capture_snapshot(self) -> bytes:
         """Return the latest JPEG frame bytes."""
@@ -524,7 +661,7 @@ class CameraWorker:
     # ------------------------------------------------------------------
 
     def update_stream_settings(self, req: StreamSettingsRequest) -> None:
-        """Update per-camera stream settings and restart the pipeline."""
+        """Update per-camera stream settings and restart the pipeline if needed."""
         changed = False
         if req.fps is not None and req.fps != self._stream_fps:
             self._stream_fps = max(1, min(60, req.fps))
@@ -539,6 +676,14 @@ class CameraWorker:
         if req.stereo_mode is not None and req.stereo_mode != self._stereo_mode:
             self._stereo_mode = req.stereo_mode
             changed = True
+
+        # flip_180 is post-processing only — no pipeline restart needed
+        if req.flip_180 is not None and req.flip_180 != self._flip_180:
+            self._flip_180 = req.flip_180
+            logger.info(
+                "Camera %s flip_180 set to %s",
+                self.id, self._flip_180,
+            )
 
         if changed:
             logger.info(
@@ -626,6 +771,7 @@ class CameraWorker:
             stream_fps=self._stream_fps,
             mjpeg_quality=self._mjpeg_quality,
             resolution=self._resolution,
+            flip_180=self._flip_180,
         )
 
 

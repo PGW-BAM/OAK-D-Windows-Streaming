@@ -5,24 +5,38 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from .calibration import (
+    CalibrationManager,
+    CalibrationPoint,
+    CalibrationSettings,
+)
+from .angle_targets import AngleTargetManager
 from .camera_manager import CameraManager
 from .config import settings
 from .models import (
+    AngleTargetResponse,
     ApiResponse,
     BandwidthCheckRequest,
+    CalibrationAutoApplyRequest,
+    CalibrationInterpolateFocusRequest,
+    CalibrationPointResponse,
+    CalibrationProfileResponse,
     CameraControlRequest,
     CameraListResponse,
+    CaptureAngleTargetRequest,
     Detection,
     InferenceModeRequest,
     RecordingStartRequest,
+    SaveCalibrationPointRequest,
     StorageStatus,
     StreamSettingsRequest,
 )
@@ -32,7 +46,13 @@ from .bandwidth import (
     build_bandwidth_matrix,
     check_feasibility,
 )
-from .recording import RecordingWorker, cleanup_old_recordings, get_storage_stats
+from .recording import (
+    MetadataProvider,
+    RecordingMetadata,
+    RecordingWorker,
+    cleanup_old_recordings,
+    get_storage_stats,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,28 +67,133 @@ logger = logging.getLogger(__name__)
 camera_manager = CameraManager()
 recording_workers: dict[str, RecordingWorker] = {}
 
+# Calibration store (loaded at startup)
+CALIBRATION_PATH = Path(__file__).parent.parent / "config" / "calibration.json"
+calibration_manager = CalibrationManager(CALIBRATION_PATH)
+
+# Radial-angle teach targets (loaded at startup)
+ANGLE_TARGETS_PATH = Path(__file__).parent.parent / "config" / "angle_targets.json"
+angle_target_manager = AngleTargetManager(ANGLE_TARGETS_PATH)
+
 # MQTT service (lazy — only started if broker is configured)
 mqtt_service = None
+
+# Background task handle for calibration auto-apply loop
+_calibration_task: asyncio.Task | None = None
+
+
+async def _calibration_auto_apply_loop() -> None:
+    """Per-camera auto-apply with continuous focus interpolation.
+
+    - When the IMU angle is within tolerance of a calibration point, the full
+      settings bundle from the nearest point is applied once per point entry
+      (debounced by point index).
+    - Between points, `manual_focus` is continuously interpolated (IDW over
+      the 3 nearest points) and sent as a focus-only CameraControl whenever
+      the interpolated value changes by >=1 LSB. Exposure/WB/etc. keep
+      snap-to-nearest semantics.
+    - If the nearest point has auto_focus=True, or interpolation is disabled
+      for that camera, behaviour collapses back to the original snap-only mode.
+
+    Exceptions on one camera do not stop the loop.
+    """
+    last_applied_idx: dict[str, int] = {}
+    last_focus_sent: dict[str, int] = {}
+    try:
+        while True:
+            await asyncio.sleep(0.5)
+            for worker in camera_manager.all_workers():
+                try:
+                    cal = calibration_manager.get_camera(worker.id)
+                    if not cal.auto_apply:
+                        # Reset so re-enabling auto-apply reapplies the nearest point
+                        last_applied_idx.pop(worker.id, None)
+                        last_focus_sent.pop(worker.id, None)
+                        continue
+                    angle = worker.get_imu_angle()
+                    if angle is None:
+                        continue
+                    result = calibration_manager.interpolate_focus(
+                        worker.id, angle[0], angle[1]
+                    )
+                    if result is None:
+                        continue
+                    idx, point, focus = result
+
+                    bundle_changed = last_applied_idx.get(worker.id) != idx
+                    if bundle_changed:
+                        # Apply full settings bundle once on entry to this point.
+                        # If the camera is using interpolated focus (i.e. the
+                        # user disabled auto_focus and `interpolate_focus` is on
+                        # with >=2 points), override the bundle's focus fields
+                        # with the interpolated value so autofocus doesn't
+                        # re-engage on every point crossing.
+                        settings_dump = point.settings.model_dump()
+                        if not point.settings.auto_focus and cal.interpolate_focus and len(cal.points) >= 2:
+                            settings_dump["auto_focus"] = False
+                            settings_dump["manual_focus"] = focus
+                        ctrl = CameraControlRequest(**settings_dump)
+                        worker.apply_control(ctrl)
+                        last_applied_idx[worker.id] = idx
+                        last_focus_sent[worker.id] = focus
+                        logger.info(
+                            "Auto-applied calibration point #%d (%s) to camera %s",
+                            idx, point.label or "unlabeled", worker.id[:8],
+                        )
+                        continue
+
+                    # Same bundle — check if interpolated focus moved
+                    prev_focus = last_focus_sent.get(worker.id)
+                    if prev_focus is None or abs(focus - prev_focus) >= 1:
+                        ctrl = CameraControlRequest(
+                            auto_focus=False,
+                            manual_focus=focus,
+                        )
+                        worker.apply_control(ctrl)
+                        last_focus_sent[worker.id] = focus
+                        logger.debug(
+                            "focus interp: cam=%s roll=%.2f pitch=%.2f -> focus=%d (near #%d)",
+                            worker.id[:8], angle[0], angle[1], focus, idx,
+                        )
+                except Exception as exc:
+                    logger.debug("calibration auto-apply error on %s: %s", worker.id[:8], exc)
+    except asyncio.CancelledError:
+        return
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    global mqtt_service
+    global mqtt_service, _calibration_task
 
     logger.info("Starting camera discovery …")
     ids = camera_manager.discover()
     logger.info("Found %d camera(s) at startup: %s", len(ids), ids)
 
+    # Load persisted calibration profiles
+    calibration_manager.load()
+    angle_target_manager.load()
+
     # Start MQTT service (non-blocking, auto-reconnects in background)
     try:
         from .mqtt.service import MqttService
-        mqtt_service = MqttService(camera_manager)
+        mqtt_service = MqttService(camera_manager, angle_target_manager)
         await mqtt_service.start()
     except Exception as exc:
         logger.warning("MQTT service failed to start (standalone mode): %s", exc)
         mqtt_service = None
 
+    # Start calibration auto-apply background loop
+    _calibration_task = asyncio.create_task(_calibration_auto_apply_loop())
+
     yield
+
+    # Stop calibration loop
+    if _calibration_task:
+        _calibration_task.cancel()
+        try:
+            await _calibration_task
+        except asyncio.CancelledError:
+            pass
 
     # Shutdown MQTT
     if mqtt_service:
@@ -326,6 +451,34 @@ def _get_or_create_recording_worker(camera_id: str) -> RecordingWorker:
     return recording_workers[camera_id]
 
 
+def _cam_id_for_worker(worker) -> str:
+    """Map a CameraWorker to its logical cam_id (cam1, cam2, ...) by discovery order."""
+    workers = camera_manager.all_workers()
+    idx = next((i for i, w in enumerate(workers) if w.id == worker.id), 0)
+    return f"cam{idx + 1}"
+
+
+def _make_metadata_provider(worker, cam_id: str) -> MetadataProvider:
+    """Return a zero-argument callable that snapshots IMU angles + drive positions."""
+    def provider() -> RecordingMetadata:
+        imu = worker.get_imu_angle()
+        drives: dict[str, float | None] = {}
+        if mqtt_service is not None:
+            try:
+                drives = mqtt_service.get_drive_positions(cam_id)
+            except Exception:
+                pass
+        return RecordingMetadata(
+            cam_id=cam_id,
+            timestamp=datetime.now(timezone.utc),
+            roll_deg=imu[0] if imu else None,
+            pitch_deg=imu[1] if imu else None,
+            drive_a=drives.get("drive_a"),
+            drive_b=drives.get("drive_b"),
+        )
+    return provider
+
+
 @app.post("/api/camera/{camera_id}/recording/start", response_model=ApiResponse)
 async def start_recording(camera_id: str, req: RecordingStartRequest) -> ApiResponse:
     try:
@@ -346,18 +499,28 @@ async def start_recording(camera_id: str, req: RecordingStartRequest) -> ApiResp
     from .models import StereoMode
     stereo_capture = worker._stereo_mode in (StereoMode.stereo_only, StereoMode.both)
 
+    cam_id = _cam_id_for_worker(worker)
+    metadata_provider = _make_metadata_provider(worker, cam_id)
+
     # Attach recording worker to camera worker
     worker.recording_worker = rec_worker
     worker._recording = True
     worker._recording_mode = req.mode
 
     try:
-        output_path = rec_worker.start(
-            req.mode, req.interval_seconds,
-            output_dir=custom_dir,
-            filename_prefix=req.filename_prefix,
-            stereo_capture=stereo_capture,
-            fps=worker._stream_fps,
+        # rec_worker.start() calls stop() first (potentially closing a container)
+        # then opens a new AV container — offload so the event loop stays live
+        output_path = await asyncio.to_thread(
+            rec_worker.start,
+            req.mode,
+            req.interval_seconds,
+            custom_dir,
+            req.filename_prefix,
+            stereo_capture,
+            worker._stream_fps,
+            metadata_provider,
+            req.clip_duration_seconds,
+            req.clip_interval_seconds,
         )
     except Exception as exc:
         # Roll back recording state so the camera worker doesn't feed a broken recorder
@@ -379,13 +542,15 @@ async def stop_recording(camera_id: str) -> ApiResponse:
     if not rec_worker or not rec_worker.active:
         raise HTTPException(409, "No active recording")
 
-    rec_worker.stop()
+    # Stop feeding new frames into the recorder immediately
     worker._recording = False
     worker._recording_mode = None
     worker.recording_worker = None
-
-    # Check storage after recording
-    cleanup_old_recordings()
+    # Drain the mux queue and close the container — can be slow at high fps,
+    # offload so the event loop keeps serving the live MJPEG stream
+    await asyncio.to_thread(rec_worker.stop)
+    # Disk scan — also synchronous, keep off the event loop
+    await asyncio.to_thread(cleanup_old_recordings)
     return ApiResponse(ok=True, message="Recording stopped")
 
 
@@ -407,17 +572,25 @@ async def start_recording_all(req: RecordingStartRequest) -> ApiResponse:
 
             stereo_capture = worker._stereo_mode in (StereoMode.stereo_only, StereoMode.both)
 
+            cam_id = _cam_id_for_worker(worker)
+            metadata_provider = _make_metadata_provider(worker, cam_id)
+
             worker.recording_worker = rec_worker
             worker._recording = True
             worker._recording_mode = req.mode
 
             try:
-                rec_worker.start(
-                    req.mode, req.interval_seconds,
-                    output_dir=custom_dir,
-                    filename_prefix=req.filename_prefix,
-                    stereo_capture=stereo_capture,
-                    fps=worker._stream_fps,
+                await asyncio.to_thread(
+                    rec_worker.start,
+                    req.mode,
+                    req.interval_seconds,
+                    custom_dir,
+                    req.filename_prefix,
+                    stereo_capture,
+                    worker._stream_fps,
+                    metadata_provider,
+                    req.clip_duration_seconds,
+                    req.clip_interval_seconds,
                 )
             except Exception as exc:
                 worker._recording = False
@@ -441,13 +614,13 @@ async def stop_recording_all() -> ApiResponse:
     for worker in camera_manager.all_workers():
         rec_worker = recording_workers.get(worker.id)
         if rec_worker and rec_worker.active:
-            rec_worker.stop()
             worker._recording = False
             worker._recording_mode = None
             worker.recording_worker = None
+            await asyncio.to_thread(rec_worker.stop)
             stopped.append(worker.id[:8])
 
-    cleanup_old_recordings()
+    await asyncio.to_thread(cleanup_old_recordings)
     return ApiResponse(ok=True, message=f"Stopped {len(stopped)} recording(s)", data=stopped)
 
 
@@ -484,6 +657,250 @@ async def get_detections(camera_id: str) -> Detection | None:
     except KeyError:
         raise HTTPException(404, f"Camera {camera_id!r} not found")
     return worker.detection_buffer.get()
+
+
+@app.get("/api/camera/{camera_id}/imu")
+async def get_imu(camera_id: str) -> dict:
+    """Return the latest IMU angles (roll + pitch in degrees) for the given camera."""
+    try:
+        worker = camera_manager.get_worker(camera_id)
+    except KeyError:
+        raise HTTPException(404, f"Camera {camera_id!r} not found")
+    angle = worker.get_imu_angle()
+    if angle is None:
+        return {"has_data": False, "roll_deg": 0.0, "pitch_deg": 0.0}
+    return {"has_data": True, "roll_deg": round(angle[0], 2), "pitch_deg": round(angle[1], 2)}
+
+
+# ---------------------------------------------------------------------------
+# Calibration (IMU angle → camera settings)
+# ---------------------------------------------------------------------------
+
+def _profile_response(camera_id: str) -> CalibrationProfileResponse:
+    cal = calibration_manager.get_camera(camera_id)
+    points = [
+        CalibrationPointResponse(
+            index=i,
+            label=p.label,
+            roll_deg=p.roll_deg,
+            pitch_deg=p.pitch_deg,
+            settings=p.settings.model_dump(),
+            created_at=p.created_at.isoformat(),
+        )
+        for i, p in enumerate(cal.points)
+    ]
+    return CalibrationProfileResponse(
+        camera_id=camera_id,
+        auto_apply=cal.auto_apply,
+        tolerance_deg=cal.tolerance_deg,
+        interpolate_focus=cal.interpolate_focus,
+        points=points,
+    )
+
+
+@app.get("/api/camera/{camera_id}/calibration", response_model=CalibrationProfileResponse)
+async def get_calibration(camera_id: str) -> CalibrationProfileResponse:
+    try:
+        camera_manager.get_worker(camera_id)
+    except KeyError:
+        raise HTTPException(404, f"Camera {camera_id!r} not found")
+    return _profile_response(camera_id)
+
+
+@app.post("/api/camera/{camera_id}/calibration/point", response_model=ApiResponse)
+async def save_calibration_point(
+    camera_id: str, req: SaveCalibrationPointRequest
+) -> ApiResponse:
+    """Capture current IMU angle + provided settings as a new calibration point."""
+    try:
+        worker = camera_manager.get_worker(camera_id)
+    except KeyError:
+        raise HTTPException(404, f"Camera {camera_id!r} not found")
+
+    angle = worker.get_imu_angle()
+    if angle is None:
+        raise HTTPException(503, "No IMU data available — cannot capture calibration point")
+
+    # Drop None fields from the control request so unset values don't overwrite defaults
+    settings_dict = req.settings.model_dump(exclude_none=True)
+    cal_settings = CalibrationSettings(**settings_dict)
+
+    point = CalibrationPoint(
+        label=req.label,
+        roll_deg=round(angle[0], 2),
+        pitch_deg=round(angle[1], 2),
+        settings=cal_settings,
+    )
+    idx = calibration_manager.add_point(camera_id, point)
+    try:
+        calibration_manager.save()
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to persist calibration: {exc}")
+    return ApiResponse(
+        ok=True,
+        message=f"Saved calibration point {idx} at roll={point.roll_deg}° pitch={point.pitch_deg}°",
+        data={"index": idx, "roll_deg": point.roll_deg, "pitch_deg": point.pitch_deg},
+    )
+
+
+@app.delete("/api/camera/{camera_id}/calibration/point/{index}", response_model=ApiResponse)
+async def delete_calibration_point(camera_id: str, index: int) -> ApiResponse:
+    try:
+        camera_manager.get_worker(camera_id)
+    except KeyError:
+        raise HTTPException(404, f"Camera {camera_id!r} not found")
+    try:
+        calibration_manager.delete_point(camera_id, index)
+    except IndexError as exc:
+        raise HTTPException(404, str(exc))
+    calibration_manager.save()
+    return ApiResponse(ok=True, message=f"Deleted calibration point {index}")
+
+
+@app.post("/api/camera/{camera_id}/calibration/auto-apply", response_model=ApiResponse)
+async def set_calibration_auto_apply(
+    camera_id: str, req: CalibrationAutoApplyRequest
+) -> ApiResponse:
+    try:
+        camera_manager.get_worker(camera_id)
+    except KeyError:
+        raise HTTPException(404, f"Camera {camera_id!r} not found")
+    calibration_manager.set_auto_apply(camera_id, req.enabled, req.tolerance_deg)
+    calibration_manager.save()
+    return ApiResponse(
+        ok=True,
+        message=f"Auto-apply {'enabled' if req.enabled else 'disabled'}",
+    )
+
+
+@app.post(
+    "/api/camera/{camera_id}/calibration/interpolate-focus",
+    response_model=ApiResponse,
+)
+async def set_calibration_interpolate_focus(
+    camera_id: str, req: CalibrationInterpolateFocusRequest
+) -> ApiResponse:
+    try:
+        camera_manager.get_worker(camera_id)
+    except KeyError:
+        raise HTTPException(404, f"Camera {camera_id!r} not found")
+    calibration_manager.set_interpolate_focus(camera_id, req.enabled)
+    calibration_manager.save()
+    return ApiResponse(
+        ok=True,
+        message=f"Focus interpolation {'enabled' if req.enabled else 'disabled'}",
+    )
+
+
+@app.post("/api/camera/{camera_id}/calibration/apply-nearest", response_model=ApiResponse)
+async def apply_nearest_calibration(camera_id: str) -> ApiResponse:
+    """One-shot: read current IMU, find the nearest saved point, apply its settings."""
+    try:
+        worker = camera_manager.get_worker(camera_id)
+    except KeyError:
+        raise HTTPException(404, f"Camera {camera_id!r} not found")
+    angle = worker.get_imu_angle()
+    if angle is None:
+        raise HTTPException(503, "No IMU data available")
+    match = calibration_manager.find_nearest(camera_id, angle[0], angle[1])
+    if match is None:
+        return ApiResponse(
+            ok=False,
+            message="No calibration point within tolerance of current angle",
+        )
+    idx, point = match
+    ctrl = CameraControlRequest(**point.settings.model_dump())
+    try:
+        worker.apply_control(ctrl)
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to apply control: {exc}")
+    return ApiResponse(
+        ok=True,
+        message=f"Applied calibration point #{idx}"
+                + (f" ({point.label})" if point.label else ""),
+        data={"index": idx, "roll_deg": point.roll_deg, "pitch_deg": point.pitch_deg},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Radial-angle teach targets (closed-loop drive correction)
+# ---------------------------------------------------------------------------
+
+def _angle_target_to_response(name: str, target: Any) -> AngleTargetResponse:
+    return AngleTargetResponse(
+        checkpoint_name=name,
+        axis=target.axis,
+        active_angle=target.active_angle,
+        target_angle_deg=target.target_angle_deg,
+        motor_position=target.motor_position,
+        label=target.label,
+        created_at=target.created_at.isoformat(),
+    )
+
+
+@app.get("/api/angle_targets")
+async def list_angle_targets() -> dict[str, list[AngleTargetResponse]]:
+    """All stored radial-angle teach targets grouped by cam_id."""
+    store = angle_target_manager.list_all()
+    return {
+        cam_id: [_angle_target_to_response(name, t) for name, t in targets.items()]
+        for cam_id, targets in store.items()
+    }
+
+
+@app.get("/api/angle_targets/{cam_id}")
+async def list_angle_targets_for_camera(cam_id: str) -> list[AngleTargetResponse]:
+    targets = angle_target_manager.list_camera(cam_id)
+    return [_angle_target_to_response(name, t) for name, t in targets.items()]
+
+
+@app.post("/api/angle_targets/capture", response_model=AngleTargetResponse)
+async def capture_angle_target(req: CaptureAngleTargetRequest) -> AngleTargetResponse:
+    """Snapshot current IMU angle + axis-b motor position for a checkpoint."""
+    try:
+        worker = camera_manager.get_worker(req.camera_id)
+    except KeyError:
+        raise HTTPException(404, f"Camera {req.camera_id!r} not found")
+
+    angle = worker.get_imu_angle()
+    if angle is None:
+        raise HTTPException(503, "No IMU data available — cannot teach angle target")
+
+    if mqtt_service is None:
+        raise HTTPException(503, "MQTT service not running — cannot read drive position")
+
+    positions = mqtt_service.get_drive_positions(req.cam_id)
+    motor_position = positions.get("b")
+    if motor_position is None:
+        raise HTTPException(
+            503,
+            f"No axis-b drive position known for {req.cam_id} yet — move the drive once first",
+        )
+
+    target = angle_target_manager.capture(
+        req.cam_id,
+        req.checkpoint_name,
+        active_angle=req.active_angle,
+        current_imu_roll_deg=angle[0],
+        current_imu_pitch_deg=angle[1],
+        motor_position=float(motor_position),
+        axis="b",
+        label=req.label,
+    )
+    try:
+        angle_target_manager.save()
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to persist angle targets: {exc}")
+
+    return _angle_target_to_response(req.checkpoint_name, target)
+
+
+@app.delete("/api/angle_targets/{cam_id}/{checkpoint_name}", response_model=ApiResponse)
+async def delete_angle_target(cam_id: str, checkpoint_name: str) -> ApiResponse:
+    if not angle_target_manager.delete(cam_id, checkpoint_name):
+        raise HTTPException(404, f"No angle target {checkpoint_name!r} for {cam_id!r}")
+    angle_target_manager.save()
+    return ApiResponse(ok=True, message=f"Deleted angle target {checkpoint_name!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +941,32 @@ async def set_recordings_dir(body: dict) -> ApiResponse:
         raise HTTPException(400, f"Cannot create directory: {exc}")
     settings.recordings_dir = p
     return ApiResponse(ok=True, message=f"Recordings directory set to {p}")
+
+
+# ---------------------------------------------------------------------------
+# Last session (persist last-used UI/camera settings across restarts)
+# ---------------------------------------------------------------------------
+
+from .session_store import load_last_session, save_last_session
+
+
+@app.get("/api/session/last", response_model=ApiResponse)
+async def get_last_session() -> ApiResponse:
+    data = load_last_session()
+    return ApiResponse(
+        ok=True,
+        message="Last session loaded" if data else "No previous session",
+        data=data,
+    )
+
+
+@app.post("/api/session/save", response_model=ApiResponse)
+async def save_session(payload: dict) -> ApiResponse:
+    try:
+        save_last_session(payload)
+    except OSError as exc:
+        raise HTTPException(500, f"Cannot save session: {exc}")
+    return ApiResponse(ok=True, message="Session saved")
 
 
 # ---------------------------------------------------------------------------

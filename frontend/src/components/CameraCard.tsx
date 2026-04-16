@@ -1,6 +1,7 @@
 import { useRef, useState, useEffect } from 'react'
 import { DetectionOverlay } from './DetectionOverlay'
-import { enableCamera, disableCamera, stopRecording, useDetections, useStreamUrl } from '../hooks/useCamera'
+import { ImuOverlay } from './ImuOverlay'
+import { enableCamera, disableCamera, stopRecording, useDetections, useImuData, useStreamUrl } from '../hooks/useCamera'
 import type { CameraStatus } from '../types'
 
 interface Props {
@@ -15,6 +16,7 @@ interface Props {
 export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximize, onRestore }: Props) {
   const streamUrl = useStreamUrl(camera.id)
   const detection = useDetections(camera.id)
+  const imu = useImuData(camera.id)
   const imgRef = useRef<HTMLImageElement>(null)
   const [imgSize, setImgSize] = useState({ w: 0, h: 0 })
   const [imgError, setImgError] = useState(false)
@@ -100,6 +102,7 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
                 height={imgSize.h}
               />
             )}
+            {imu && <ImuOverlay imu={imu} />}
             {/* Recording overlay — visible on the stream so it can't be missed */}
             {camera.recording && (
               <div style={{
@@ -242,6 +245,9 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
           <span style={{ color: '#88ff88' }}>
             {camera.inference_mode === 'on_camera' ? 'AI cam' : 'AI host'}
           </span>
+        )}
+        {camera.flip_180 && (
+          <span style={{ color: '#ffaa44' }} title="Stream rotated 180°">↻180°</span>
         )}
 
         {/* Controls (right-aligned) */}

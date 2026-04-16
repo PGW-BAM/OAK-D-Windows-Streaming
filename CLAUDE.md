@@ -36,6 +36,14 @@ Raspberry Pi 5 ─────────────────┘
 - **SQLite history** — 24h rolling connectivity/alert log (`backend/mqtt/history.py`)
 - **REST API** — `/api/mqtt/status`, `/api/mqtt/sequence/*`, `/api/mqtt/history/*`
 - **Config** — `config/mqtt.yaml` (broker, orchestration, alerts, SMTP)
+- **IMU-driven calibration** — live accelerometer-based roll/pitch per camera,
+  with operator-taught control presets that auto-apply by nearest angle
+  (`backend/calibration.py`, `config/calibration.json`).
+- **Radial-angle teach mode** — operator-taught IMU angles per checkpoint for
+  closed-loop radial-drive correction (`backend/angle_targets.py`,
+  `config/angle_targets.json`). REST endpoints at `/api/angle_targets/*`.
+  Orchestrator injects `target_angle_deg` + `resync_position` into axis-b
+  `MoveCommand`s so the Pi runs iterative converge-and-resync.
 
 ### Pi side (documented, not coded)
 - `docs/RASPBERRY_PI_IMPLEMENTATION.md` — full guide with GPIO wiring, Mosquitto setup, drive controller reference code, systemd services

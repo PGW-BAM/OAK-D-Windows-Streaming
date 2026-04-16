@@ -1,5 +1,5 @@
 export type InferenceMode = 'none' | 'on_camera' | 'host'
-export type RecordingMode = 'video' | 'interval'
+export type RecordingMode = 'video' | 'interval' | 'scheduled'
 export type StereoMode = 'main_only' | 'stereo_only' | 'both'
 
 export interface CameraStatus {
@@ -19,6 +19,7 @@ export interface CameraStatus {
   stream_fps: number
   mjpeg_quality: number
   resolution: string
+  flip_180?: boolean
 }
 
 export interface BoundingBox {
@@ -67,6 +68,7 @@ export interface StreamSettingsRequest {
   mjpeg_quality?: number
   resolution?: string
   stereo_mode?: StereoMode
+  flip_180?: boolean
 }
 
 export interface BandwidthEstimate {
@@ -104,4 +106,61 @@ export interface ApiResponse<T = unknown> {
   ok: boolean
   message: string
   data?: T
+}
+
+export interface IMUData {
+  has_data: boolean
+  roll_deg: number
+  pitch_deg: number
+}
+
+export interface CalibrationSettings {
+  auto_focus: boolean
+  manual_focus: number
+  auto_exposure: boolean
+  exposure_us: number | null
+  iso: number | null
+  auto_white_balance: boolean
+  white_balance_k: number | null
+  brightness: number
+  contrast: number
+  saturation: number
+  sharpness: number
+  luma_denoise: number
+  chroma_denoise: number
+}
+
+export interface CalibrationPoint {
+  index: number
+  label: string
+  roll_deg: number
+  pitch_deg: number
+  settings: CalibrationSettings
+  created_at: string
+}
+
+export interface CalibrationProfile {
+  camera_id: string
+  auto_apply: boolean
+  tolerance_deg: number
+  interpolate_focus: boolean
+  points: CalibrationPoint[]
+}
+
+export interface AngleTarget {
+  checkpoint_name: string
+  axis: string
+  active_angle: 'roll' | 'pitch'
+  target_angle_deg: number
+  motor_position: number
+  label: string
+  created_at: string
+}
+
+export interface CaptureAngleTargetRequest {
+  camera_id: string
+  cam_id: string
+  checkpoint_name: string
+  active_angle: 'roll' | 'pitch'
+  label?: string
 }

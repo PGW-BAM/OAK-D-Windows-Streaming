@@ -1,6 +1,6 @@
 from __future__ import annotations
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel
 
 
@@ -13,6 +13,7 @@ class InferenceMode(str, Enum):
 class RecordingMode(str, Enum):
     video = "video"
     interval = "interval"
+    scheduled = "scheduled"     # fixed-duration clips at a repeating interval
 
 
 class StereoMode(str, Enum):
@@ -39,6 +40,7 @@ class CameraStatus(BaseModel):
     stream_fps: int = 20
     mjpeg_quality: int = 85
     resolution: str = "720p"
+    flip_180: bool = False  # Rotate stream 180° for ceiling-mounted cameras
 
 
 class CameraControlRequest(BaseModel):
@@ -66,6 +68,7 @@ class StreamSettingsRequest(BaseModel):
     mjpeg_quality: int | None = None     # 1–100
     resolution: str | None = None        # "4k", "1080p", "720p", "480p"
     stereo_mode: StereoMode | None = None
+    flip_180: bool | None = None         # Rotate stream 180° for ceiling-mounted cameras
 
 
 class RecordingStartRequest(BaseModel):
@@ -73,6 +76,9 @@ class RecordingStartRequest(BaseModel):
     interval_seconds: float = 5.0        # for interval mode
     output_dir: str | None = None        # custom output directory (uses default if None)
     filename_prefix: str = ""            # prefix for output filenames
+    # Scheduled mode: record clip_duration_seconds every clip_interval_seconds
+    clip_duration_seconds: float = 5.0   # length of each clip
+    clip_interval_seconds: float = 80.0  # total cycle time (clip + idle)
 
 
 class InferenceModeRequest(BaseModel):
@@ -122,3 +128,60 @@ class ApiResponse(BaseModel):
     ok: bool
     message: str
     data: Any = None
+
+
+# ---------------------------------------------------------------------------
+# Calibration (IMU angle → camera settings)
+# ---------------------------------------------------------------------------
+
+class SaveCalibrationPointRequest(BaseModel):
+    label: str = ""
+    settings: CameraControlRequest          # reuse — may contain None fields
+
+
+class CalibrationAutoApplyRequest(BaseModel):
+    enabled: bool
+    tolerance_deg: float | None = None
+
+
+class CalibrationPointResponse(BaseModel):
+    index: int
+    label: str
+    roll_deg: float
+    pitch_deg: float
+    settings: dict
+    created_at: str
+
+
+class CalibrationInterpolateFocusRequest(BaseModel):
+    enabled: bool
+
+
+class CalibrationProfileResponse(BaseModel):
+    camera_id: str
+    auto_apply: bool
+    tolerance_deg: float
+    interpolate_focus: bool = True
+    points: list[CalibrationPointResponse]
+
+
+# ---------------------------------------------------------------------------
+# Radial-angle teach targets (closed-loop drive correction)
+# ---------------------------------------------------------------------------
+
+class CaptureAngleTargetRequest(BaseModel):
+    camera_id: str            # OAK-D device mxid — source of the IMU reading
+    cam_id: str               # logical cam_id ("cam1"/"cam2") — MQTT key
+    checkpoint_name: str
+    active_angle: Literal["roll", "pitch"]
+    label: str = ""
+
+
+class AngleTargetResponse(BaseModel):
+    checkpoint_name: str
+    axis: str
+    active_angle: str
+    target_angle_deg: float
+    motor_position: float
+    label: str
+    created_at: str

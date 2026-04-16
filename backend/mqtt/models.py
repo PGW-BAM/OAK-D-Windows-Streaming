@@ -25,6 +25,9 @@ class MoveCommand(BaseModel):
     target_position: float
     speed: float = 1.0
     checkpoint_name: str | None = None  # if set, Pi runs IMU drift check after settling
+    target_angle_deg: float | None = None
+    active_angle: Literal["roll", "pitch"] | None = None
+    resync_position: float | None = None
     timestamp: datetime = Field(default_factory=_now)
 
 
@@ -136,6 +139,7 @@ class CaptureStep(BaseModel):
     cam_id: str
     position: PositionTarget
     settling_delay_ms: int = 150
+    checkpoint_name: str | None = None  # if set, orchestrator looks up angle target
 
 
 class CaptureSequence(BaseModel):
@@ -189,4 +193,6 @@ class DriftDetectionEvent(BaseModel):
     drift_deg: float
     correction_steps: int
     corrected: bool
+    iterations: int = 1
+    resynced_to: float | None = None
     timestamp: datetime = Field(default_factory=_now)

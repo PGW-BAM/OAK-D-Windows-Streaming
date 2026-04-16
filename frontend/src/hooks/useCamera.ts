@@ -1,5 +1,17 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { BandwidthEstimate, BandwidthMatrix, CameraStatus, Detection, StreamSettingsRequest } from '../types'
+import type {
+  AngleTarget,
+  ApiResponse,
+  BandwidthEstimate,
+  BandwidthMatrix,
+  CalibrationProfile,
+  CameraControlRequest,
+  CameraStatus,
+  CaptureAngleTargetRequest,
+  Detection,
+  IMUData,
+  StreamSettingsRequest,
+} from '../types'
 
 const API = '/api'
 
@@ -58,6 +70,26 @@ export function useStreamUrl(cameraId: string) {
   return `${API}/camera/${cameraId}/stream`
 }
 
+export function useImuData(cameraId: string, pollMs = 500) {
+  const [imu, setImu] = useState<IMUData | null>(null)
+
+  useEffect(() => {
+    if (!cameraId) return
+    const id = setInterval(async () => {
+      try {
+        const res = await fetch(`${API}/camera/${cameraId}/imu`)
+        if (res.ok) {
+          const data: IMUData = await res.json()
+          setImu(data.has_data ? data : null)
+        }
+      } catch { /* ignore */ }
+    }, pollMs)
+    return () => clearInterval(id)
+  }, [cameraId, pollMs])
+
+  return imu
+}
+
 // ---------------------------------------------------------------------------
 // Camera enable / disable (free bandwidth)
 // ---------------------------------------------------------------------------
@@ -96,10 +128,12 @@ export async function setStreamSettings(cameraId: string, settings: StreamSettin
 
 export async function startRecording(
   cameraId: string,
-  mode: 'video' | 'interval',
+  mode: 'video' | 'interval' | 'scheduled',
   intervalSeconds = 5,
   outputDir?: string,
   filenamePrefix?: string,
+  clipDurationSeconds?: number,
+  clipIntervalSeconds?: number,
 ): Promise<{ ok: boolean; message: string; data?: string }> {
   const res = await fetch(`${API}/camera/${cameraId}/recording/start`, {
     method: 'POST',
@@ -109,6 +143,8 @@ export async function startRecording(
       interval_seconds: intervalSeconds,
       output_dir: outputDir || null,
       filename_prefix: filenamePrefix || '',
+      clip_duration_seconds: clipDurationSeconds ?? 5,
+      clip_interval_seconds: clipIntervalSeconds ?? 80,
     }),
   })
   if (!res.ok) {
@@ -165,10 +201,12 @@ export async function setStreamSettingsAll(settings: StreamSettingsRequest) {
 }
 
 export async function startRecordingAll(
-  mode: 'video' | 'interval',
+  mode: 'video' | 'interval' | 'scheduled',
   intervalSeconds = 5,
   outputDir?: string,
   filenamePrefix?: string,
+  clipDurationSeconds?: number,
+  clipIntervalSeconds?: number,
 ) {
   const res = await fetch(`${API}/cameras/recording/start`, {
     method: 'POST',
@@ -178,6 +216,8 @@ export async function startRecordingAll(
       interval_seconds: intervalSeconds,
       output_dir: outputDir || null,
       filename_prefix: filenamePrefix || '',
+      clip_duration_seconds: clipDurationSeconds ?? 5,
+      clip_interval_seconds: clipIntervalSeconds ?? 80,
     }),
   })
   return res.json()
@@ -191,6 +231,75 @@ export async function stopRecordingAll() {
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Last-session persistence
+// ---------------------------------------------------------------------------
+
+export interface CameraSessionSnapshot {
+  id: string
+  stream_fps?: number
+  mjpeg_quality?: number
+  resolution?: string
+  stereo_mode?: string
+  flip_180?: boolean
+  inference_mode?: string
+  controls?: Record<string, unknown>
+}
+
+export interface SessionSnapshot {
+  saved_at: string
+  cameras: CameraSessionSnapshot[]
+  recording?: {
+    mode?: 'video' | 'interval' | 'scheduled'
+    interval_seconds?: number
+    clip_duration_seconds?: number
+    clip_interval_seconds?: number
+    filename_prefix?: string
+    output_dir?: string
+  }
+}
+
+export async function getLastSession(): Promise<SessionSnapshot | null> {
+  try {
+    const res = await fetch(`${API}/session/last`)
+    if (!res.ok) return null
+    const data = await res.json()
+    return (data?.data ?? null) as SessionSnapshot | null
+  } catch {
+    return null
+  }
+}
+
+export async function saveSession(snapshot: SessionSnapshot): Promise<void> {
+  try {
+    await fetch(`${API}/session/save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(snapshot),
+    })
+  } catch { /* ignore */ }
+}
+
+export async function applySessionToCameras(snapshot: SessionSnapshot): Promise<void> {
+  for (const cam of snapshot.cameras ?? []) {
+    const streamReq: StreamSettingsRequest = {}
+    if (cam.stream_fps !== undefined) streamReq.fps = cam.stream_fps
+    if (cam.mjpeg_quality !== undefined) streamReq.mjpeg_quality = cam.mjpeg_quality
+    if (cam.resolution !== undefined) streamReq.resolution = cam.resolution
+    if (cam.stereo_mode !== undefined) streamReq.stereo_mode = cam.stereo_mode as never
+    if (cam.flip_180 !== undefined) streamReq.flip_180 = cam.flip_180
+    if (Object.keys(streamReq).length > 0) {
+      try { await setStreamSettings(cam.id, streamReq) } catch { /* ignore */ }
+    }
+    if (cam.controls && Object.keys(cam.controls).length > 0) {
+      try { await applyControl(cam.id, cam.controls) } catch { /* ignore */ }
+    }
+    if (cam.inference_mode) {
+      try { await setInferenceMode(cam.id, cam.inference_mode as never) } catch { /* ignore */ }
+    }
+  }
+}
 
 export async function getRecordingsDir(): Promise<string> {
   const res = await fetch(`${API}/settings/recordings-dir`)
@@ -212,6 +321,145 @@ export async function setRecordingsDir(path: string): Promise<void> {
 
 export async function getBandwidthMatrix(): Promise<BandwidthMatrix> {
   const res = await fetch(`${API}/bandwidth/matrix`)
+  return res.json()
+}
+
+// ---------------------------------------------------------------------------
+// Calibration (IMU angle → camera settings)
+// ---------------------------------------------------------------------------
+
+export function useCalibration(cameraId: string) {
+  const [profile, setProfile] = useState<CalibrationProfile | null>(null)
+
+  const refresh = useCallback(async () => {
+    if (!cameraId) return
+    try {
+      const res = await fetch(`${API}/camera/${cameraId}/calibration`)
+      if (res.ok) {
+        const data: CalibrationProfile = await res.json()
+        setProfile(data)
+      }
+    } catch { /* ignore */ }
+  }, [cameraId])
+
+  useEffect(() => { refresh() }, [refresh])
+
+  return { profile, refresh }
+}
+
+export async function saveCalibrationPoint(
+  cameraId: string,
+  label: string,
+  settings: CameraControlRequest,
+): Promise<ApiResponse> {
+  const res = await fetch(`${API}/camera/${cameraId}/calibration/point`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ label, settings }),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ message: res.statusText }))
+    throw new Error(body?.detail ?? body?.message ?? res.statusText)
+  }
+  return res.json()
+}
+
+export async function deleteCalibrationPoint(
+  cameraId: string,
+  index: number,
+): Promise<ApiResponse> {
+  const res = await fetch(`${API}/camera/${cameraId}/calibration/point/${index}`, {
+    method: 'DELETE',
+  })
+  return res.json()
+}
+
+export async function setCalibrationAutoApply(
+  cameraId: string,
+  enabled: boolean,
+  toleranceDeg?: number,
+): Promise<ApiResponse> {
+  const res = await fetch(`${API}/camera/${cameraId}/calibration/auto-apply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled, tolerance_deg: toleranceDeg ?? null }),
+  })
+  return res.json()
+}
+
+export async function setCalibrationInterpolateFocus(
+  cameraId: string,
+  enabled: boolean,
+): Promise<ApiResponse> {
+  const res = await fetch(`${API}/camera/${cameraId}/calibration/interpolate-focus`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+  return res.json()
+}
+
+export async function applyNearestCalibration(cameraId: string): Promise<ApiResponse> {
+  const res = await fetch(`${API}/camera/${cameraId}/calibration/apply-nearest`, {
+    method: 'POST',
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ message: res.statusText }))
+    throw new Error(body?.detail ?? body?.message ?? res.statusText)
+  }
+  return res.json()
+}
+
+// ---------------------------------------------------------------------------
+// Angle targets (closed-loop radial drive correction)
+// ---------------------------------------------------------------------------
+
+export function useAngleTargets(camId: string, pollMs = 5000) {
+  const [targets, setTargets] = useState<AngleTarget[]>([])
+
+  const refresh = useCallback(async () => {
+    if (!camId) return
+    try {
+      const res = await fetch(`${API}/angle_targets/${camId}`)
+      if (res.ok) {
+        const data = (await res.json()) as AngleTarget[]
+        setTargets(Array.isArray(data) ? data : [])
+      }
+    } catch { /* ignore */ }
+  }, [camId])
+
+  useEffect(() => {
+    refresh()
+    const id = setInterval(refresh, pollMs)
+    return () => clearInterval(id)
+  }, [refresh, pollMs])
+
+  return { targets, refresh }
+}
+
+export async function captureAngleTarget(
+  req: CaptureAngleTargetRequest,
+): Promise<AngleTarget> {
+  const res = await fetch(`${API}/angle_targets/capture`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ message: res.statusText }))
+    throw new Error(body?.detail ?? body?.message ?? res.statusText)
+  }
+  return res.json()
+}
+
+export async function deleteAngleTarget(
+  camId: string,
+  checkpointName: string,
+): Promise<ApiResponse> {
+  const res = await fetch(
+    `${API}/angle_targets/${camId}/${encodeURIComponent(checkpointName)}`,
+    { method: 'DELETE' },
+  )
   return res.json()
 }
 

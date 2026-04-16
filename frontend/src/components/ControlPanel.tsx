@@ -2,7 +2,12 @@ import { useEffect, useState } from 'react'
 import {
   applyControl,
   applyControlAll,
+  applyNearestCalibration,
+  deleteCalibrationPoint,
   getRecordingsDir,
+  saveCalibrationPoint,
+  setCalibrationAutoApply,
+  setCalibrationInterpolateFocus,
   setInferenceMode,
   setRecordingsDir,
   setStreamSettings,
@@ -11,9 +16,12 @@ import {
   startRecordingAll,
   stopRecording,
   stopRecordingAll,
+  useCalibration,
+  useImuData,
 } from '../hooks/useCamera'
+import { AngleTargetsPanel } from './AngleTargetsPanel'
 import { BandwidthInfo } from './BandwidthInfo'
-import type { CameraStatus, InferenceMode, StereoMode } from '../types'
+import type { CalibrationPoint, CameraStatus, InferenceMode, StereoMode } from '../types'
 
 interface Props {
   camera: CameraStatus
@@ -82,6 +90,9 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
   const [resolution, setResolution] = useState(camera.resolution)
   const [stereoMode, setStereoMode] = useState<StereoMode>(camera.stereo_mode)
 
+  const fpsMax = resolution === '4k' ? 30 : 60
+  const [flip180, setFlip180] = useState(camera.flip_180 ?? false)
+
   // Camera control
   const [autoExposure, setAutoExposure] = useState(true)
   const [exposureUs, setExposureUs] = useState(10000)
@@ -107,6 +118,23 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
   const [defaultDir, setDefaultDir] = useState('')
   const [filenamePrefix, setFilenamePrefix] = useState('')
 
+  // Scheduled recording
+  const [clipDuration, setClipDuration] = useState(5)   // seconds per clip
+  const [clipInterval, setClipInterval] = useState(80)  // total cycle seconds
+  const [schedBothCams, setSchedBothCams] = useState(false)
+
+  // Calibration
+  const { profile: calProfile, refresh: refreshCalibration } = useCalibration(camera.id)
+  const imu = useImuData(camera.id)
+  const [calOpen, setCalOpen] = useState(false)
+  const [calLabel, setCalLabel] = useState('')
+  const [calTolerance, setCalTolerance] = useState(5)
+
+  // Keep tolerance slider in sync when profile refreshes
+  useEffect(() => {
+    if (calProfile) setCalTolerance(calProfile.tolerance_deg)
+  }, [calProfile?.tolerance_deg])
+
   // UI state
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
@@ -118,6 +146,8 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
   const currentRecordingMode = applyAll
     ? allCameras.find((c) => c.recording)?.recording_mode ?? null
     : camera.recording_mode
+  const isScheduledActive = currentRecordingMode === 'scheduled'
+  const isNonScheduledActive = anyRecording && !isScheduledActive
 
   useEffect(() => {
     getRecordingsDir().then((dir) => {
@@ -128,10 +158,12 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
 
   // Sync stream settings when switching cameras
   useEffect(() => {
-    setStreamFps(camera.stream_fps)
+    const maxFps = camera.resolution === '4k' ? 30 : 60
+    setStreamFps(Math.min(camera.stream_fps, maxFps))
     setMjpegQuality(camera.mjpeg_quality)
     setResolution(camera.resolution)
     setStereoMode(camera.stereo_mode)
+    setFlip180(camera.flip_180 ?? false)
     setInferMode(camera.inference_mode)
   }, [camera.id])
 
@@ -146,6 +178,7 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
         mjpeg_quality: mjpegQuality,
         resolution,
         stereo_mode: stereoMode,
+        flip_180: flip180,
       }
       if (applyAll) {
         await setStreamSettingsAll(payload)
@@ -186,6 +219,111 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
       }
     } catch { flash('Error applying control') }
     finally { setBusy(false) }
+  }
+
+  // --- Calibration ---
+  function buildCurrentControl() {
+    // Mirrors sendControl()'s payload shape so saved point reflects what is actually applied.
+    return {
+      auto_exposure: autoExposure,
+      ...(autoExposure ? {} : { exposure_us: exposureUs, iso }),
+      auto_focus: autoFocus,
+      ...(autoFocus ? {} : { manual_focus: manualFocus }),
+      auto_white_balance: autoWb,
+      ...(autoWb ? {} : { white_balance_k: wbK }),
+      brightness,
+      contrast,
+      saturation,
+      sharpness,
+      luma_denoise: lumaDenoise,
+      chroma_denoise: chromaDenoise,
+    }
+  }
+
+  async function handleSaveCalPoint() {
+    setBusy(true)
+    try {
+      await saveCalibrationPoint(camera.id, calLabel, buildCurrentControl())
+      setCalLabel('')
+      await refreshCalibration()
+      flash('Calibration point saved')
+    } catch (err) {
+      flash(`Save failed: ${err instanceof Error ? err.message : 'unknown error'}`)
+    } finally { setBusy(false) }
+  }
+
+  async function handleApplyCalPoint(p: CalibrationPoint) {
+    setBusy(true)
+    try {
+      // Update sliders to match the point so the UI reflects what's on the device
+      setAutoFocus(p.settings.auto_focus)
+      setManualFocus(p.settings.manual_focus)
+      setAutoExposure(p.settings.auto_exposure)
+      if (p.settings.exposure_us != null) setExposureUs(p.settings.exposure_us)
+      if (p.settings.iso != null) setIso(p.settings.iso)
+      setAutoWb(p.settings.auto_white_balance)
+      if (p.settings.white_balance_k != null) setWbK(p.settings.white_balance_k)
+      setBrightness(p.settings.brightness)
+      setContrast(p.settings.contrast)
+      setSaturation(p.settings.saturation)
+      setSharpness(p.settings.sharpness)
+      setLumaDenoise(p.settings.luma_denoise)
+      setChromaDenoise(p.settings.chroma_denoise)
+      await applyControl(camera.id, p.settings as unknown as Record<string, unknown>)
+      flash(`Applied calibration #${p.index}${p.label ? ` (${p.label})` : ''}`)
+    } catch { flash('Error applying calibration') }
+    finally { setBusy(false) }
+  }
+
+  async function handleDeleteCalPoint(idx: number) {
+    if (!confirm(`Delete calibration point #${idx}?`)) return
+    setBusy(true)
+    try {
+      await deleteCalibrationPoint(camera.id, idx)
+      await refreshCalibration()
+      flash(`Deleted point #${idx}`)
+    } catch { flash('Error deleting point') }
+    finally { setBusy(false) }
+  }
+
+  async function handleToggleAutoApply(enabled: boolean) {
+    setBusy(true)
+    try {
+      await setCalibrationAutoApply(camera.id, enabled, calTolerance)
+      await refreshCalibration()
+      flash(`Auto-apply ${enabled ? 'on' : 'off'}`)
+    } catch { flash('Error toggling auto-apply') }
+    finally { setBusy(false) }
+  }
+
+  async function handleToggleInterpolateFocus(enabled: boolean) {
+    setBusy(true)
+    try {
+      await setCalibrationInterpolateFocus(camera.id, enabled)
+      await refreshCalibration()
+      flash(`Focus interpolation ${enabled ? 'on' : 'off'}`)
+    } catch { flash('Error toggling focus interpolation') }
+    finally { setBusy(false) }
+  }
+
+  async function handleToleranceCommit() {
+    if (!calProfile) return
+    setBusy(true)
+    try {
+      await setCalibrationAutoApply(camera.id, calProfile.auto_apply, calTolerance)
+      await refreshCalibration()
+    } catch { /* ignore */ }
+    finally { setBusy(false) }
+  }
+
+  async function handleApplyNearest() {
+    setBusy(true)
+    try {
+      const res = await applyNearestCalibration(camera.id)
+      flash(res.message)
+    } catch (err) {
+      flash(`Error: ${err instanceof Error ? err.message : 'unknown'}`)
+    } finally { setBusy(false) }
   }
 
   // --- Inference ---
@@ -239,6 +377,39 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
       }
       onRefresh()
     } catch { flash('Error stopping recording') }
+    finally { setBusy(false) }
+  }
+
+  async function handleStartScheduled() {
+    setBusy(true)
+    try {
+      const customDir = outputDir !== defaultDir ? outputDir : undefined
+      const bothCams = schedBothCams || applyAll
+      if (bothCams) {
+        await startRecordingAll('scheduled', intervalSecs, customDir, filenamePrefix, clipDuration, clipInterval)
+        flash(`Scheduled recording started on all cameras — ${clipDuration}s clips every ${clipInterval}s`)
+      } else {
+        const result = await startRecording(camera.id, 'scheduled', intervalSecs, customDir, filenamePrefix, clipDuration, clipInterval)
+        flash(`Scheduled recording started — ${clipDuration}s clips every ${clipInterval}s → ${result?.data ?? outputDir}`)
+      }
+      onRefresh()
+    } catch (err) { flash(`Error starting scheduled recording: ${err instanceof Error ? err.message : 'unknown error'}`) }
+    finally { setBusy(false) }
+  }
+
+  async function handleStopScheduled() {
+    setBusy(true)
+    try {
+      const bothCams = schedBothCams || applyAll
+      if (bothCams) {
+        await stopRecordingAll()
+        flash('Scheduled recording stopped on all cameras')
+      } else {
+        await stopRecording(camera.id)
+        flash('Scheduled recording stopped')
+      }
+      onRefresh()
+    } catch { flash('Error stopping scheduled recording') }
     finally { setBusy(false) }
   }
 
@@ -299,11 +470,19 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
       {/* ========== STREAM SETTINGS ========== */}
       <section style={sectionStyle}>
         <h4 style={headingStyle}>Stream Settings</h4>
-        <Slider label="FPS" min={1} max={60} value={streamFps} onChange={setStreamFps} />
+        <Slider label={`FPS${resolution === '4k' ? ' (max 30 at 4K)' : ''}`} min={1} max={fpsMax} value={streamFps} onChange={setStreamFps} />
         <Slider label="MJPEG Quality" min={10} max={100} step={5} value={mjpegQuality} onChange={setMjpegQuality} />
         <label style={{ display: 'flex', flexDirection: 'column', gap: 2, fontSize: 12, marginTop: 4 }}>
           <span>Resolution</span>
-          <select value={resolution} onChange={(e) => setResolution(e.target.value)} style={selectStyle}>
+          <select
+            value={resolution}
+            onChange={(e) => {
+              const res = e.target.value
+              setResolution(res)
+              if (res === '4k') setStreamFps(fps => Math.min(fps, 30))
+            }}
+            style={selectStyle}
+          >
             <option value="4k">4K (3840x2160)</option>
             <option value="1080p">1080p (1920x1080)</option>
             <option value="720p">720p (1280x720)</option>
@@ -318,6 +497,22 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
             <option value="stereo_only">Stereo only (L/R)</option>
           </select>
         </label>
+        <label style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          fontSize: 12, marginTop: 8, marginBottom: 8, cursor: 'pointer',
+          padding: '6px 8px', background: '#1a1a2e',
+          border: `1px solid ${flip180 ? '#ffaa44' : '#333'}`, borderRadius: 4,
+        }}>
+          <input
+            type="checkbox"
+            checked={flip180}
+            onChange={(e) => setFlip180(e.target.checked)}
+          />
+          <span style={{ color: flip180 ? '#ffaa44' : '#ccc' }}>
+            ↻ Rotate stream 180° (ceiling/head mount)
+          </span>
+        </label>
+
         {/* Bandwidth feasibility indicator */}
         <BandwidthInfo
           resolution={resolution}
@@ -367,6 +562,162 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
           <Slider label="Manual focus" min={0} max={255} value={manualFocus} onChange={setManualFocus} />
         )}
       </section>
+
+      {/* ========== CALIBRATION ========== */}
+      <section style={{ ...sectionStyle, background: '#15152a', padding: '8px 10px', borderRadius: 6, border: '1px solid #333' }}>
+        <div
+          onClick={() => setCalOpen((v) => !v)}
+          style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer', marginBottom: calOpen ? 10 : 0 }}
+        >
+          <h4 style={{ ...headingStyle, margin: 0 }}>Calibration (IMU → settings)</h4>
+          <span style={{ color: '#aaa', fontSize: 11 }}>
+            {calProfile?.points.length ?? 0} pt{(calProfile?.points.length ?? 0) === 1 ? '' : 's'}
+            {' '}{calOpen ? '▾' : '▸'}
+          </span>
+        </div>
+
+        {calOpen && (
+          <>
+            {/* Live IMU readout */}
+            <div style={{
+              fontSize: 11, color: imu ? '#8fc' : '#666', background: '#0d0d1a',
+              padding: '6px 8px', borderRadius: 4, marginBottom: 8, fontFamily: 'monospace',
+            }}>
+              IMU:&nbsp;
+              {imu
+                ? <>Roll {imu.roll_deg.toFixed(1)}°&nbsp; Pitch {imu.pitch_deg.toFixed(1)}°</>
+                : <>no data</>}
+            </div>
+
+            {/* Label + save */}
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, marginBottom: 6 }}>
+              <span>Label (optional)</span>
+              <input
+                type="text"
+                placeholder="e.g. position-A close"
+                value={calLabel}
+                onChange={(e) => setCalLabel(e.target.value)}
+                style={inputStyle}
+              />
+            </label>
+            <button
+              onClick={handleSaveCalPoint}
+              disabled={busy || !imu}
+              title={imu ? 'Save current IMU angle + control sliders as a calibration point' : 'Waiting for IMU data'}
+              style={{ ...btnPrimary, background: '#446644', marginBottom: 10 }}
+            >
+              Save current position
+            </button>
+
+            {/* Saved points */}
+            {calProfile && calProfile.points.length > 0 && (
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 11, color: '#99a', marginBottom: 4 }}>Saved points</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {calProfile.points.map((p) => (
+                    <div
+                      key={p.index}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 6,
+                        padding: '4px 6px', background: '#0d0d1a',
+                        border: '1px solid #2a2a44', borderRadius: 4, fontSize: 11,
+                      }}
+                    >
+                      <span style={{ color: '#88a', width: 20 }}>#{p.index}</span>
+                      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {p.label || <span style={{ color: '#555' }}>(unlabeled)</span>}
+                      </span>
+                      <span style={{ color: '#aaa', fontFamily: 'monospace', fontSize: 10 }}>
+                        R{p.roll_deg >= 0 ? '+' : ''}{p.roll_deg.toFixed(1)}°
+                        &nbsp;P{p.pitch_deg >= 0 ? '+' : ''}{p.pitch_deg.toFixed(1)}°
+                        &nbsp;F{p.settings.manual_focus}
+                      </span>
+                      <button
+                        onClick={() => handleApplyCalPoint(p)}
+                        disabled={busy}
+                        style={{
+                          padding: '2px 6px', background: '#335', border: '1px solid #557',
+                          borderRadius: 3, color: '#cdf', fontSize: 10, cursor: 'pointer',
+                        }}
+                      >
+                        Apply
+                      </button>
+                      <button
+                        onClick={() => handleDeleteCalPoint(p.index)}
+                        disabled={busy}
+                        title="Delete"
+                        style={{
+                          padding: '2px 6px', background: '#522', border: '1px solid #744',
+                          borderRadius: 3, color: '#faa', fontSize: 10, cursor: 'pointer',
+                        }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Auto-apply + tolerance */}
+            <label style={{
+              display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
+              padding: '6px 8px', background: '#0d0d1a', borderRadius: 4, marginBottom: 8,
+              cursor: 'pointer',
+            }}>
+              <input
+                type="checkbox"
+                checked={calProfile?.auto_apply ?? false}
+                onChange={(e) => handleToggleAutoApply(e.target.checked)}
+                disabled={busy}
+              />
+              <span>Auto-apply nearest point</span>
+            </label>
+
+            <label style={{
+              display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
+              padding: '6px 8px', background: '#0d0d1a', borderRadius: 4, marginBottom: 8,
+              cursor: calProfile?.auto_apply ? 'pointer' : 'not-allowed',
+              opacity: calProfile?.auto_apply ? 1 : 0.5,
+            }}>
+              <input
+                type="checkbox"
+                checked={calProfile?.interpolate_focus ?? true}
+                onChange={(e) => handleToggleInterpolateFocus(e.target.checked)}
+                disabled={busy || !calProfile?.auto_apply}
+              />
+              <span>Interpolate focus between points</span>
+            </label>
+
+            <div onMouseUp={handleToleranceCommit} onTouchEnd={handleToleranceCommit}>
+              <Slider
+                label="Tolerance (°)"
+                min={1}
+                max={15}
+                step={0.5}
+                value={calTolerance}
+                onChange={setCalTolerance}
+              />
+            </div>
+
+            <button
+              onClick={handleApplyNearest}
+              disabled={busy || !imu || !calProfile || calProfile.points.length === 0}
+              style={{ ...btnPrimary, background: '#335588', marginTop: 6 }}
+            >
+              Apply nearest now
+            </button>
+          </>
+        )}
+      </section>
+
+      {/* ========== RADIAL ANGLE TEACH ========== */}
+      <AngleTargetsPanel
+        cameraId={camera.id}
+        camId={`cam${Math.max(1, allCameras.findIndex((c) => c.id === camera.id) + 1)}`}
+        imu={imu}
+        onFlash={setMsg}
+      />
 
       {/* ========== WHITE BALANCE ========== */}
       <section style={sectionStyle}>
@@ -442,8 +793,8 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
 
         <Slider label="Interval (s)" min={1} max={60} value={intervalSecs} onChange={setIntervalSecs} />
 
-        {/* Recording status */}
-        {anyRecording && (
+        {/* Recording status (video / interval) */}
+        {isNonScheduledActive && (
           <div style={{
             background: '#331a1a', border: '1px solid #663333', borderRadius: 4,
             padding: '6px 10px', fontSize: 11, color: '#ff8888', marginTop: 8, marginBottom: 8,
@@ -455,7 +806,7 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
           {/* Start buttons */}
-          {!anyRecording && (
+          {!isNonScheduledActive && (
             <div style={{ display: 'flex', gap: 6 }}>
               <button
                 onClick={() => handleStartRecording('video')}
@@ -473,14 +824,96 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
               </button>
             </div>
           )}
-          {/* Stop button */}
-          {anyRecording && (
+          {/* Stop button (non-scheduled) */}
+          {isNonScheduledActive && (
             <button
               onClick={handleStopRecording}
               disabled={busy}
               style={{ ...btnPrimary, background: '#883333' }}
             >
               Stop recording{applyAll ? ' (all)' : ''}
+            </button>
+          )}
+        </div>
+
+        {/* ---- Scheduled recording sub-section ---- */}
+        <div style={{
+          marginTop: 14, padding: '10px 10px 8px', background: '#111a2e',
+          border: `1px solid ${isScheduledActive ? '#44aaff' : '#2a3a55'}`, borderRadius: 6,
+        }}>
+          <div style={{ fontSize: 12, color: '#88bbff', fontWeight: 700, marginBottom: 8 }}>
+            Scheduled clips
+          </div>
+
+          <Slider
+            label={`Clip duration (s)`}
+            min={1}
+            max={300}
+            step={1}
+            value={clipDuration}
+            onChange={(v) => setClipDuration(Math.min(v, clipInterval - 1))}
+          />
+          <Slider
+            label={`Interval / cycle (s)`}
+            min={clipDuration + 1}
+            max={3600}
+            step={1}
+            value={clipInterval}
+            onChange={setClipInterval}
+          />
+          <div style={{ fontSize: 10, color: '#557', marginBottom: 8 }}>
+            Idle between clips: {clipInterval - clipDuration}s
+            &nbsp;·&nbsp;~{Math.round(clipDuration / clipInterval * 100)}% duty cycle
+          </div>
+
+          {/* Both-cameras toggle */}
+          <label style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            fontSize: 12, cursor: 'pointer', marginBottom: 8,
+            padding: '5px 7px', background: '#0d1525',
+            border: `1px solid ${schedBothCams ? '#44aaff' : '#2a3a55'}`, borderRadius: 4,
+          }}>
+            <input
+              type="checkbox"
+              checked={schedBothCams || applyAll}
+              disabled={applyAll}
+              onChange={(e) => setSchedBothCams(e.target.checked)}
+              style={{ accentColor: '#44aaff' }}
+            />
+            <span style={{ color: (schedBothCams || applyAll) ? '#88ccff' : '#999' }}>
+              Apply to both cameras simultaneously
+            </span>
+          </label>
+
+          {/* Scheduled active status */}
+          {isScheduledActive && (
+            <div style={{
+              background: '#0a1e3a', border: '1px solid #2255aa', borderRadius: 4,
+              padding: '5px 8px', fontSize: 11, color: '#66aaff', marginBottom: 8,
+            }}>
+              Scheduled recording active
+              {(schedBothCams || applyAll) && ` on ${allCameras.filter(c => c.recording).length} camera(s)`}
+              &nbsp;— {clipDuration}s clips every {clipInterval}s
+            </div>
+          )}
+
+          {!isScheduledActive ? (
+            <button
+              onClick={handleStartScheduled}
+              disabled={busy}
+              style={{ ...btnPrimary, background: '#1e4488' }}
+            >
+              Start scheduled
+              {(schedBothCams || applyAll) ? ' (both cams)' : ''}
+            </button>
+          ) : (
+            <button
+              onClick={handleStopScheduled}
+              disabled={busy}
+              style={{ ...btnPrimary, background: '#883333' }}
+            >
+              Stop scheduled
+              {(schedBothCams || applyAll) ? ' (both cams)' : ''}
             </button>
           )}
         </div>
