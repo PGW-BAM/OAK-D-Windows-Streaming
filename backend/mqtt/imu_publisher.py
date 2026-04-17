@@ -8,8 +8,11 @@ Two publishing modes:
      Responds immediately with a fresh IMUAngle echoing the request_id so
      the Pi's DriftDetector can resolve its pending Future.
 
-cam_id → worker mapping follows the same convention as the orchestrator:
-  cam1 → workers()[0], cam2 → workers()[1], ...  (discovery order)
+cam_id → worker mapping is resolved by CameraManager from the IMU roll
+sign at startup (cam1 = upside-down / negative roll, cam2 = right-side-up
+/ positive roll). This keeps the Dashboard angle widgets tied to the
+correct physical camera across restarts regardless of DepthAI
+enumeration order.
 """
 from __future__ import annotations
 
@@ -17,7 +20,6 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
-from .config import mqtt_settings
 from .models import IMUAngle, IMUCheckRequest
 from .topics import Topics
 
@@ -45,7 +47,6 @@ class ImuPublisher:
     def __init__(self, mqtt: MqttClient, camera_manager: CameraManager) -> None:
         self._mqtt = mqtt
         self._camera_manager = camera_manager
-        self._cam_ids: list[str] = mqtt_settings.cam_ids
         self._running = False
         self._bg_task: asyncio.Task | None = None
 
@@ -80,13 +81,10 @@ class ImuPublisher:
         """Publish IMUAngle for every connected camera at ~2 Hz."""
         while self._running:
             try:
-                workers = self._camera_manager.all_workers()
-                for idx, worker in enumerate(workers):
+                for worker in self._camera_manager.all_workers():
                     if not worker._connected:
                         continue
-                    cam_id = self._cam_id_for_index(idx)
-                    if cam_id is None:
-                        continue
+                    cam_id = self._camera_manager.get_cam_id(worker)
                     await self._publish_angle(worker, cam_id, request_id=None)
             except asyncio.CancelledError:
                 raise
@@ -161,21 +159,6 @@ class ImuPublisher:
             qos=1 if request_id else 0,  # QoS 1 for correlated responses, 0 for background
         )
 
-    def _cam_id_for_index(self, index: int) -> str | None:
-        """Return the cam_id string for a worker at the given discovery index."""
-        if index < len(self._cam_ids):
-            return self._cam_ids[index]
-        return None
-
     def _worker_for_cam_id(self, cam_id: str) -> CameraWorker | None:
         """Return the CameraWorker for the given cam_id, or None if not found."""
-        try:
-            cam_index = int(cam_id.replace("cam", "")) - 1
-        except ValueError:
-            logger.warning("Cannot parse cam_id: %r", cam_id)
-            return None
-
-        workers = self._camera_manager.all_workers()
-        if cam_index < 0 or cam_index >= len(workers):
-            return None
-        return workers[cam_index]
+        return self._camera_manager.get_worker_by_cam_id(cam_id)

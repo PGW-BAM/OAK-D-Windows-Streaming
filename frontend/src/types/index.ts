@@ -1,5 +1,5 @@
 export type InferenceMode = 'none' | 'on_camera' | 'host'
-export type RecordingMode = 'video' | 'interval' | 'scheduled'
+export type RecordingMode = 'video' | 'interval' | 'scheduled' | 'sequential'
 export type StereoMode = 'main_only' | 'stereo_only' | 'both'
 
 export interface CameraStatus {

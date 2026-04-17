@@ -201,12 +201,15 @@ export async function setStreamSettingsAll(settings: StreamSettingsRequest) {
 }
 
 export async function startRecordingAll(
-  mode: 'video' | 'interval' | 'scheduled',
+  mode: 'video' | 'interval' | 'scheduled' | 'sequential',
   intervalSeconds = 5,
   outputDir?: string,
   filenamePrefix?: string,
   clipDurationSeconds?: number,
   clipIntervalSeconds?: number,
+  interCameraGapSeconds?: number,
+  imuChangeThresholdDeg?: number,
+  imuSettleSeconds?: number,
 ) {
   const res = await fetch(`${API}/cameras/recording/start`, {
     method: 'POST',
@@ -218,9 +221,23 @@ export async function startRecordingAll(
       filename_prefix: filenamePrefix || '',
       clip_duration_seconds: clipDurationSeconds ?? 5,
       clip_interval_seconds: clipIntervalSeconds ?? 80,
+      inter_camera_gap_seconds: interCameraGapSeconds ?? 5,
+      imu_change_threshold_deg: imuChangeThresholdDeg ?? 5,
+      imu_settle_seconds: imuSettleSeconds ?? 3,
     }),
   })
   return res.json()
+}
+
+export async function getFleetRecordingStatus(): Promise<{ sequential_active: boolean; any_recording: boolean }> {
+  try {
+    const res = await fetch(`${API}/cameras/recording/status`)
+    if (!res.ok) return { sequential_active: false, any_recording: false }
+    const data = await res.json()
+    return data.data ?? { sequential_active: false, any_recording: false }
+  } catch {
+    return { sequential_active: false, any_recording: false }
+  }
 }
 
 export async function stopRecordingAll() {

@@ -781,6 +781,13 @@ class CameraManager:
     def __init__(self) -> None:
         self._workers: dict[str, CameraWorker] = {}
         self._lock = threading.Lock()
+        # Physical cam_id mapping: mx_id -> "cam1"/"cam2".
+        # Resolved once per session from IMU roll sign (cam1 = upside-down /
+        # negative roll, cam2 = right-side-up / positive roll) so Dashboard
+        # widgets keyed on cam_id stay tied to the correct physical camera
+        # across restarts regardless of DepthAI enumeration order.
+        self._cam_id_by_mxid: dict[str, str] = {}
+        self._mapping_resolved: bool = False
 
     def discover(self) -> list[str]:
         """Scan for available OAK devices and start workers for new ones."""
@@ -817,6 +824,134 @@ class CameraManager:
     def all_statuses(self) -> list[CameraStatus]:
         return [w.status for w in self.all_workers()]
 
+    # ------------------------------------------------------------------
+    # Physical cam_id resolution (roll-sign based)
+    # ------------------------------------------------------------------
+
+    def resolve_cam_ids_by_roll(
+        self,
+        timeout_s: float = 8.0,
+        samples_per_worker: int = 5,
+        sample_interval_s: float = 0.3,
+    ) -> dict[str, str]:
+        """Assign cam1/cam2 based on physical IMU roll sign.
+
+        Cam1 is mounted upside-down so its raw accelerometer-derived roll is
+        negative; cam2 is right-side-up so its raw roll is positive. Discovery
+        order from `dai.Device.getAllAvailableDevices()` is non-deterministic,
+        so we use this physical signal instead to make cam_ids stable across
+        restarts.
+
+        Falls back to discovery order if IMU data is unavailable or both
+        workers report the same sign (e.g. one camera running, ambiguous mount).
+        The resolved mapping is cached for the lifetime of the manager.
+        """
+        workers = self.all_workers()
+        mapping: dict[str, str] = {}
+
+        # Wait for IMU data from every connected worker (bounded by timeout).
+        deadline = time.monotonic() + timeout_s
+        ready: list[CameraWorker] = []
+        while time.monotonic() < deadline:
+            ready = [w for w in workers if w._connected and w.get_imu_angle() is not None]
+            if len(ready) == len(workers) and ready:
+                break
+            time.sleep(0.2)
+
+        # Collect a small window of raw roll samples per worker and average.
+        roll_by_mxid: dict[str, float] = {}
+        for _ in range(samples_per_worker):
+            for w in ready:
+                angle = w.get_imu_angle()
+                if angle is None:
+                    continue
+                roll_by_mxid.setdefault(w.id, 0.0)
+                roll_by_mxid[w.id] += angle[0]
+            time.sleep(sample_interval_s)
+        for mxid in list(roll_by_mxid.keys()):
+            roll_by_mxid[mxid] /= samples_per_worker
+
+        def _fallback_mapping() -> dict[str, str]:
+            return {w.id: f"cam{i + 1}" for i, w in enumerate(workers)}
+
+        if not roll_by_mxid:
+            logger.warning(
+                "cam_id auto-detection: no IMU data within %.1fs — falling back to discovery order",
+                timeout_s,
+            )
+            mapping = _fallback_mapping()
+        elif len(roll_by_mxid) == 1:
+            mxid, roll = next(iter(roll_by_mxid.items()))
+            cam_id = "cam1" if roll < 0 else "cam2"
+            mapping[mxid] = cam_id
+            # Remaining workers (if any joined late) get discovery-order fallback.
+            for i, w in enumerate(workers):
+                mapping.setdefault(w.id, f"cam{i + 1}")
+            logger.info(
+                "cam_id auto-detection: single camera — %s (mean roll=%.2f°) -> %s",
+                mxid[:8], roll, cam_id,
+            )
+        elif len(roll_by_mxid) >= 2:
+            items = sorted(roll_by_mxid.items(), key=lambda kv: kv[1])
+            neg_mxid, neg_roll = items[0]
+            pos_mxid, pos_roll = items[-1]
+            if neg_roll < 0 < pos_roll:
+                mapping[neg_mxid] = "cam1"
+                mapping[pos_mxid] = "cam2"
+                # Any extra cameras beyond the two extremes keep discovery order.
+                leftover_idx = 3
+                for w in workers:
+                    if w.id not in mapping:
+                        mapping[w.id] = f"cam{leftover_idx}"
+                        leftover_idx += 1
+                logger.info(
+                    "cam_id auto-detection: %s (roll=%.2f°) -> cam1, %s (roll=%.2f°) -> cam2",
+                    neg_mxid[:8], neg_roll, pos_mxid[:8], pos_roll,
+                )
+            else:
+                logger.warning(
+                    "cam_id auto-detection: rolls have same sign "
+                    "(%s=%.2f°, %s=%.2f°) — falling back to discovery order",
+                    neg_mxid[:8], neg_roll, pos_mxid[:8], pos_roll,
+                )
+                mapping = _fallback_mapping()
+
+        with self._lock:
+            self._cam_id_by_mxid = mapping
+            self._mapping_resolved = True
+        return dict(mapping)
+
+    def get_cam_id(self, worker: CameraWorker) -> str:
+        """Return the logical cam_id for a worker.
+
+        Uses the roll-sign mapping resolved at startup. Falls back to
+        discovery-order positioning for workers not in the mapping (e.g. a
+        camera that reconnected after initial resolution).
+        """
+        with self._lock:
+            cam_id = self._cam_id_by_mxid.get(worker.id)
+            if cam_id is not None:
+                return cam_id
+            workers = list(self._workers.values())
+        idx = next((i for i, w in enumerate(workers) if w.id == worker.id), 0)
+        return f"cam{idx + 1}"
+
+    def get_worker_by_cam_id(self, cam_id: str) -> CameraWorker | None:
+        """Reverse lookup: logical cam_id -> CameraWorker (or None)."""
+        with self._lock:
+            for mxid, cid in self._cam_id_by_mxid.items():
+                if cid == cam_id and mxid in self._workers:
+                    return self._workers[mxid]
+            # Fallback: parse numeric index from cam_id for unmapped workers.
+            try:
+                idx = int(cam_id.replace("cam", "")) - 1
+            except ValueError:
+                return None
+            workers = list(self._workers.values())
+        if 0 <= idx < len(workers):
+            return workers[idx]
+        return None
+
     def shutdown(self) -> None:
         with self._lock:
             workers = list(self._workers.values())
@@ -824,3 +959,5 @@ class CameraManager:
             w.stop()
         with self._lock:
             self._workers.clear()
+            self._cam_id_by_mxid.clear()
+            self._mapping_resolved = False

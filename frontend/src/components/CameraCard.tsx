@@ -217,15 +217,15 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: 8,
-          padding: '4px 8px',
+          gap: 10,
+          padding: '7px 12px',
           background: 'rgba(0,0,0,0.75)',
-          fontSize: 11,
+          fontSize: 15,
           color: '#ccc',
           fontFamily: 'monospace',
         }}
       >
-        <span style={{ color: statusColor, fontSize: 8 }}>●</span>
+        <span style={{ color: statusColor, fontSize: 11 }}>●</span>
         <span style={{ fontWeight: 700, color: '#eee' }}>{camera.name}</span>
         {camera.ip && <span style={{ color: '#888' }}>{camera.ip}</span>}
         <span>{camera.stream_fps} fps</span>
@@ -251,7 +251,7 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
         )}
 
         {/* Controls (right-aligned) */}
-        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 10, alignItems: 'center' }}>
           <button
             onClick={toggleEnabled}
             disabled={toggling}
@@ -259,7 +259,7 @@ export function CameraCard({ camera, onSettings, onRefresh, maximized, onMaximiz
             style={{
               ...btnStyle,
               color: camera.enabled ? '#44dd66' : '#666',
-              fontSize: 13,
+              fontSize: 20,
             }}
           >
             ⏻
@@ -287,7 +287,7 @@ const btnStyle: React.CSSProperties = {
   border: 'none',
   color: '#aaa',
   cursor: 'pointer',
-  fontSize: 14,
-  padding: '0 2px',
+  fontSize: 20,
+  padding: '2px 6px',
   lineHeight: 1,
 }

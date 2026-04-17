@@ -126,7 +126,9 @@ class VideoRecorder:
         self._container = av.open(str(self._path), mode="w")
         self._stream = self._container.add_stream("mjpeg", rate=self.fps)
         self._stream.pix_fmt = "yuvj420p"
-        self._stream.time_base = Fraction(1, self.fps)
+        # 1 ms resolution — PTS is wall-clock from the first frame, so real
+        # elapsed time is preserved regardless of actual incoming framerate
+        self._stream.time_base = Fraction(1, 1000)
         self._active = True
         self._mux_thread = threading.Thread(
             target=self._mux_loop,
@@ -168,22 +170,38 @@ class VideoRecorder:
             logger.debug("Mux queue full for %s — frame dropped", self.camera_id)
 
     def _mux_loop(self) -> None:
-        """Drain the queue and write frames to the MP4 container."""
+        """Drain the queue and write frames to the MP4 container.
+
+        PTS is assigned from the monotonic clock (ms since first frame) so the
+        MP4 reflects real elapsed time — critical when the camera delivers
+        frames at a rate different from the configured ``fps``.
+        """
         import av
-        pts = 0
-        time_base = Fraction(1, self.fps)
+        time_base = Fraction(1, 1000)
+        start_monotonic: float | None = None
+        last_pts = -1
         while True:
             item = self._queue.get()
             if item is None:  # stop sentinel
                 break
             try:
+                now = time.monotonic()
+                if start_monotonic is None:
+                    start_monotonic = now
+                    pts = 0
+                else:
+                    pts = int((now - start_monotonic) * 1000)
+                # PTS must be strictly monotonic for MP4; bump if the clock
+                # didn't tick (sub-millisecond back-to-back frames)
+                if pts <= last_pts:
+                    pts = last_pts + 1
+                last_pts = pts
                 packet = av.Packet(item)
                 packet.stream = self._stream
                 packet.pts = pts
                 packet.dts = pts
                 packet.time_base = time_base
                 self._container.mux(packet)
-                pts += 1
             except Exception as exc:
                 logger.warning("Video mux error for %s: %s", self.camera_id, exc)
 
@@ -498,6 +516,187 @@ class ScheduledVideoRecorder:
             idle = self.clip_interval_seconds - self.clip_duration_seconds
             if idle > 0:
                 self._stop_event.wait(idle)
+
+
+# ---------------------------------------------------------------------------
+# Sequential interleaved recording (cameras take turns, IMU-gated between cycles)
+# ---------------------------------------------------------------------------
+
+class SequentialRecorder:
+    """Records cameras one at a time in order, then waits for a position change.
+
+    Cycle timeline:
+      cam1 records clip_duration_s
+      → inter_camera_gap_s pause
+      → cam2 records clip_duration_s
+      → wait until IMU roll shifts > imu_change_threshold_deg
+      → wait imu_settle_s
+      → repeat from cam1
+
+    Each slot uses a plain VideoRecorder (wall-clock PTS) so clips are full-length.
+    If IMU data is unavailable, the position-wait is skipped and the cycle repeats
+    immediately (graceful degradation).
+    """
+
+    def __init__(
+        self,
+        slots: list[tuple[str, "RecordingWorker", object]],  # (cam_id, rec_worker, cam_worker)
+        clip_duration_seconds: float = 5.0,
+        inter_camera_gap_seconds: float = 5.0,
+        imu_change_threshold_deg: float = 5.0,
+        imu_settle_seconds: float = 3.0,
+        fps: int = 20,
+        output_dir: Path | None = None,
+        prefix: str = "",
+        metadata_provider_factory: Optional[Callable[[str], MetadataProvider]] = None,
+    ) -> None:
+        self.clip_duration_seconds = max(1.0, clip_duration_seconds)
+        self.inter_camera_gap_seconds = max(0.0, inter_camera_gap_seconds)
+        self.imu_change_threshold_deg = max(0.1, imu_change_threshold_deg)
+        self.imu_settle_seconds = max(0.0, imu_settle_seconds)
+        self.fps = fps
+        self._output_dir = output_dir
+        self._prefix = prefix
+        self._slots = slots  # ordered list of (cam_id, rec_worker, cam_worker)
+        self._metadata_provider_factory = metadata_provider_factory
+
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._cycle = 0
+        self._active = False
+
+    def start(self) -> None:
+        self._stop_event.clear()
+        self._active = True
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="sequential-recorder",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info(
+            "Sequential recording started — %d camera(s), clip=%.0fs, gap=%.0fs, "
+            "IMU threshold=%.1f°, settle=%.0fs",
+            len(self._slots),
+            self.clip_duration_seconds,
+            self.inter_camera_gap_seconds,
+            self.imu_change_threshold_deg,
+            self.imu_settle_seconds,
+        )
+
+    def stop(self) -> None:
+        self._active = False
+        self._stop_event.set()
+        # Stop any currently-recording slot
+        for _cam_id, rec_worker, _cam_worker in self._slots:
+            if rec_worker.active:
+                try:
+                    rec_worker.stop()
+                except Exception as exc:
+                    logger.warning("Error stopping rec_worker during sequential stop: %s", exc)
+        if self._thread:
+            self._thread.join(timeout=self.clip_duration_seconds + self.inter_camera_gap_seconds + 15)
+            if self._thread.is_alive():
+                logger.warning("Sequential recorder thread did not finish in time")
+            self._thread = None
+        logger.info("Sequential recording stopped")
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def _get_roll(self, cam_worker: object) -> float | None:
+        """Read the current roll angle from the camera worker's IMU buffer."""
+        try:
+            result = cam_worker.get_imu_angle()  # type: ignore[attr-defined]
+            if result is None:
+                return None
+            roll, _pitch = result
+            return roll
+        except Exception:
+            return None
+
+    def _wait_for_position_change(self, cam_worker: object) -> None:
+        """Block until IMU roll changes by > threshold or stop is requested."""
+        baseline = self._get_roll(cam_worker)
+        if baseline is None:
+            logger.debug("Sequential: no IMU data — skipping position-change wait")
+            return
+        logger.info(
+            "Sequential: waiting for position change (baseline roll=%.1f°, threshold=%.1f°)",
+            baseline, self.imu_change_threshold_deg,
+        )
+        while not self._stop_event.is_set():
+            self._stop_event.wait(0.5)
+            current = self._get_roll(cam_worker)
+            if current is None:
+                continue
+            if abs(current - baseline) >= self.imu_change_threshold_deg:
+                logger.info(
+                    "Sequential: position change detected (roll %.1f° → %.1f°), settling %.0fs",
+                    baseline, current, self.imu_settle_seconds,
+                )
+                self._stop_event.wait(self.imu_settle_seconds)
+                return
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._cycle += 1
+            logger.info("Sequential: starting cycle %d", self._cycle)
+
+            for idx, (cam_id, rec_worker, cam_worker) in enumerate(self._slots):
+                if self._stop_event.is_set():
+                    break
+
+                meta_provider = (
+                    self._metadata_provider_factory(cam_id)
+                    if self._metadata_provider_factory else None
+                )
+                suffix = f"seq{self._cycle:04d}"
+
+                # Wire recording active flag directly — same pattern as main.py endpoints
+                cam_worker._recording = True  # type: ignore[attr-defined]
+                cam_worker._recording_mode = "sequential"  # type: ignore[attr-defined]
+                cam_worker.recording_worker = rec_worker  # type: ignore[attr-defined]
+
+                try:
+                    rec_worker.start(
+                        RecordingMode.video,
+                        output_dir=self._output_dir,
+                        filename_prefix=self._prefix,
+                        fps=self.fps,
+                        metadata_provider=meta_provider,
+                    )
+                except Exception as exc:
+                    logger.warning("Sequential: failed to start clip for %s: %s", cam_id, exc)
+                    cam_worker._recording = False  # type: ignore[attr-defined]
+                    cam_worker.recording_worker = None  # type: ignore[attr-defined]
+                    continue
+
+                logger.info("Sequential: recording cam %s (clip %d)", cam_id, self._cycle)
+                self._stop_event.wait(self.clip_duration_seconds)
+
+                # Unwire before stopping so no frames are fed after container closes
+                cam_worker._recording = False  # type: ignore[attr-defined]
+                cam_worker._recording_mode = None  # type: ignore[attr-defined]
+                cam_worker.recording_worker = None  # type: ignore[attr-defined]
+                rec_worker.stop()
+                logger.info("Sequential: finished cam %s", cam_id)
+
+                # Gap between cameras (skip after the last slot)
+                is_last = idx == len(self._slots) - 1
+                if not is_last and not self._stop_event.is_set():
+                    logger.debug("Sequential: inter-camera gap %.0fs", self.inter_camera_gap_seconds)
+                    self._stop_event.wait(self.inter_camera_gap_seconds)
+
+            if self._stop_event.is_set():
+                break
+
+            # After all cameras done: wait for IMU position change, then settle
+            # Use the first slot's cam_worker as the IMU reference
+            if self._slots:
+                _cam_id, _rec_worker, ref_cam_worker = self._slots[0]
+                self._wait_for_position_change(ref_cam_worker)
 
 
 # ---------------------------------------------------------------------------

@@ -50,6 +50,7 @@ from .recording import (
     MetadataProvider,
     RecordingMetadata,
     RecordingWorker,
+    SequentialRecorder,
     cleanup_old_recordings,
     get_storage_stats,
 )
@@ -66,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 camera_manager = CameraManager()
 recording_workers: dict[str, RecordingWorker] = {}
+sequential_recorder: SequentialRecorder | None = None
 
 # Calibration store (loaded at startup)
 CALIBRATION_PATH = Path(__file__).parent.parent / "config" / "calibration.json"
@@ -168,6 +170,31 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Starting camera discovery …")
     ids = camera_manager.discover()
     logger.info("Found %d camera(s) at startup: %s", len(ids), ids)
+
+    # Resolve physical cam1/cam2 labels from IMU roll sign. This runs in a
+    # thread because it samples the (synchronous) IMU buffers for a few
+    # seconds, and must complete before MQTT starts publishing IMU angles so
+    # the Dashboard gets stable cam_ids from the first message onward.
+    # timeout_s=30 covers cold-boot connection (DHCP + DepthAI pipeline start
+    # + first IMU sample can exceed the 8s default after a full power cycle).
+    # Falling back to discovery order here silently swaps cam1/cam2 whenever
+    # depthai enumerates the devices in reverse, which breaks the Pi's auto-
+    # calibration and manual move-to-angle (the IMU the drift detector reads
+    # belongs to the other physical camera).
+    if ids:
+        mapping = await asyncio.to_thread(
+            camera_manager.resolve_cam_ids_by_roll,
+            timeout_s=30.0,
+        )
+        if mapping:
+            logger.info("Resolved cam_id mapping (mx_id -> cam_id): %s", mapping)
+        else:
+            logger.error(
+                "cam_id roll-sign resolution returned empty mapping — cameras "
+                "may not have produced IMU data in time. Pi auto-calibration "
+                "and manual move-to-angle will fail because IMU telemetry is "
+                "published under discovery-order cam_ids that can be swapped."
+            )
 
     # Load persisted calibration profiles
     calibration_manager.load()
@@ -452,10 +479,14 @@ def _get_or_create_recording_worker(camera_id: str) -> RecordingWorker:
 
 
 def _cam_id_for_worker(worker) -> str:
-    """Map a CameraWorker to its logical cam_id (cam1, cam2, ...) by discovery order."""
-    workers = camera_manager.all_workers()
-    idx = next((i for i, w in enumerate(workers) if w.id == worker.id), 0)
-    return f"cam{idx + 1}"
+    """Map a CameraWorker to its logical cam_id (cam1, cam2, ...).
+
+    Delegates to CameraManager.get_cam_id, which resolves the mapping from
+    IMU roll sign at startup (cam1 = upside-down / negative roll,
+    cam2 = right-side-up / positive roll) so labels stay stable across
+    restarts regardless of DepthAI enumeration order.
+    """
+    return camera_manager.get_cam_id(worker)
 
 
 def _make_metadata_provider(worker, cam_id: str) -> MetadataProvider:
@@ -556,8 +587,70 @@ async def stop_recording(camera_id: str) -> ApiResponse:
 
 @app.post("/api/cameras/recording/start", response_model=ApiResponse)
 async def start_recording_all(req: RecordingStartRequest) -> ApiResponse:
-    """Start recording on ALL cameras."""
-    from .models import StereoMode
+    """Start recording on ALL cameras (parallel or sequential)."""
+    global sequential_recorder
+    from .models import RecordingMode as RM, StereoMode
+
+    # ------------------------------------------------------------------
+    # Sequential mode: one SequentialRecorder coordinates all cameras
+    # ------------------------------------------------------------------
+    if req.mode == RM.sequential:
+        if sequential_recorder and sequential_recorder.active:
+            return ApiResponse(ok=False, message="Sequential recording already active")
+
+        custom_dir = Path(req.output_dir) if req.output_dir else None
+        if custom_dir and not custom_dir.is_absolute():
+            custom_dir = Path.cwd() / custom_dir
+
+        slots = []
+        for worker in camera_manager.all_workers():
+            rec_worker = _get_or_create_recording_worker(worker.id)
+            cam_id = _cam_id_for_worker(worker)
+            slots.append((cam_id, rec_worker, worker))
+
+        if not slots:
+            return ApiResponse(ok=False, message="No cameras available")
+
+        # Build a metadata-provider factory so each clip gets the right provider
+        def _meta_factory(cam_id: str) -> MetadataProvider:
+            worker = next(
+                (w for w in camera_manager.all_workers()
+                 if _cam_id_for_worker(w) == cam_id), None
+            )
+            if worker is None:
+                return lambda: RecordingMetadata(
+                    cam_id=cam_id,
+                    timestamp=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+                    roll_deg=None, pitch_deg=None, drive_a=None, drive_b=None,
+                )
+            return _make_metadata_provider(worker, cam_id)
+
+        # Use stream_fps from first available camera
+        first_worker = camera_manager.all_workers()[0] if camera_manager.all_workers() else None
+        fps = first_worker._stream_fps if first_worker else 20
+
+        sequential_recorder = SequentialRecorder(
+            slots=slots,
+            clip_duration_seconds=req.clip_duration_seconds,
+            inter_camera_gap_seconds=req.inter_camera_gap_seconds,
+            imu_change_threshold_deg=req.imu_change_threshold_deg,
+            imu_settle_seconds=req.imu_settle_seconds,
+            fps=fps,
+            output_dir=custom_dir,
+            prefix=req.filename_prefix,
+            metadata_provider_factory=_meta_factory,
+        )
+        await asyncio.to_thread(sequential_recorder.start)
+        cam_names = [s[0] for s in slots]
+        return ApiResponse(
+            ok=True,
+            message=f"Sequential recording started — {len(slots)} camera(s): {', '.join(cam_names)}",
+            data=cam_names,
+        )
+
+    # ------------------------------------------------------------------
+    # Parallel modes (video / interval / scheduled) — existing logic
+    # ------------------------------------------------------------------
     started = []
     errors = []
     for worker in camera_manager.all_workers():
@@ -609,8 +702,17 @@ async def start_recording_all(req: RecordingStartRequest) -> ApiResponse:
 
 @app.post("/api/cameras/recording/stop", response_model=ApiResponse)
 async def stop_recording_all() -> ApiResponse:
-    """Stop recording on ALL cameras."""
+    """Stop recording on ALL cameras (handles sequential and parallel modes)."""
+    global sequential_recorder
     stopped = []
+
+    # Stop sequential recorder if active
+    if sequential_recorder and sequential_recorder.active:
+        await asyncio.to_thread(sequential_recorder.stop)
+        sequential_recorder = None
+        stopped.append("sequential")
+
+    # Stop any individually-started recorders
     for worker in camera_manager.all_workers():
         rec_worker = recording_workers.get(worker.id)
         if rec_worker and rec_worker.active:
@@ -622,6 +724,23 @@ async def stop_recording_all() -> ApiResponse:
 
     await asyncio.to_thread(cleanup_old_recordings)
     return ApiResponse(ok=True, message=f"Stopped {len(stopped)} recording(s)", data=stopped)
+
+
+@app.get("/api/cameras/recording/status", response_model=ApiResponse)
+async def fleet_recording_status() -> ApiResponse:
+    """Fleet-level recording status (covers sequential mode too)."""
+    seq_active = sequential_recorder is not None and sequential_recorder.active
+    return ApiResponse(
+        ok=True,
+        message="ok",
+        data={
+            "sequential_active": seq_active,
+            "any_recording": seq_active or any(
+                (recording_workers.get(w.id) or RecordingWorker(w.id)).active
+                for w in camera_manager.all_workers()
+            ),
+        },
+    )
 
 
 @app.get("/api/camera/{camera_id}/recording/status", response_model=ApiResponse)

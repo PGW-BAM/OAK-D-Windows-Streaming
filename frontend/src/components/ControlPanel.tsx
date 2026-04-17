@@ -12,6 +12,7 @@ import {
   setRecordingsDir,
   setStreamSettings,
   setStreamSettingsAll,
+  getFleetRecordingStatus,
   startRecording,
   startRecordingAll,
   stopRecording,
@@ -122,6 +123,22 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
   const [clipDuration, setClipDuration] = useState(5)   // seconds per clip
   const [clipInterval, setClipInterval] = useState(80)  // total cycle seconds
   const [schedBothCams, setSchedBothCams] = useState(false)
+
+  // Sequential recording
+  const [seqGap, setSeqGap] = useState(5)             // inter-camera gap (s)
+  const [seqImuThreshold, setSeqImuThreshold] = useState(5) // roll change threshold (°)
+  const [seqSettle, setSeqSettle] = useState(3)        // settle after position change (s)
+  const [seqActive, setSeqActive] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    const poll = async () => {
+      const status = await getFleetRecordingStatus()
+      if (!cancelled) setSeqActive(status.sequential_active)
+    }
+    poll()
+    const id = setInterval(poll, 2000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [])
 
   // Calibration
   const { profile: calProfile, refresh: refreshCalibration } = useCalibration(camera.id)
@@ -410,6 +427,38 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
       }
       onRefresh()
     } catch { flash('Error stopping scheduled recording') }
+    finally { setBusy(false) }
+  }
+
+  async function handleStartSequential() {
+    setBusy(true)
+    try {
+      const result = await startRecordingAll(
+        'sequential',
+        5,
+        customDir || undefined,
+        filenamePrefix,
+        clipDuration,
+        80,
+        seqGap,
+        seqImuThreshold,
+        seqSettle,
+      )
+      setSeqActive(true)
+      flash(result?.message ?? `Sequential recording started — ${clipDuration}s clips, ${seqGap}s gap, IMU threshold ${seqImuThreshold}°`)
+      onRefresh()
+    } catch (err) { flash(`Error starting sequential recording: ${err instanceof Error ? err.message : 'unknown error'}`) }
+    finally { setBusy(false) }
+  }
+
+  async function handleStopSequential() {
+    setBusy(true)
+    try {
+      await stopRecordingAll()
+      setSeqActive(false)
+      flash('Sequential recording stopped')
+      onRefresh()
+    } catch { flash('Error stopping sequential recording') }
     finally { setBusy(false) }
   }
 
@@ -914,6 +963,77 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
             >
               Stop scheduled
               {(schedBothCams || applyAll) ? ' (both cams)' : ''}
+            </button>
+          )}
+        </div>
+
+        {/* ---- Sequential interleaved recording sub-section ---- */}
+        <div style={{
+          marginTop: 10, padding: '10px 10px 8px', background: '#111a2e',
+          border: `1px solid ${seqActive ? '#44ffaa' : '#2a3a55'}`, borderRadius: 6,
+        }}>
+          <div style={{ fontSize: 12, color: '#88ffcc', fontWeight: 700, marginBottom: 8 }}>
+            Sequential (cam1 → cam2, IMU-gated)
+          </div>
+          <div style={{ fontSize: 10, color: '#557', marginBottom: 8, lineHeight: 1.4 }}>
+            Cameras record one at a time. After cam2 finishes, waits for the rig to move
+            to a new position (IMU), then repeats from cam1.
+          </div>
+
+          <Slider label={`Clip duration (s)`} min={1} max={300} step={1}
+            value={clipDuration} onChange={setClipDuration} />
+
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 2, fontSize: 12, marginBottom: 6 }}>
+            <span style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span>Inter-camera gap (s)</span>
+              <span style={{ color: '#aaa' }}>{seqGap}</span>
+            </span>
+            <input type="number" min={0} max={60} step={1} value={seqGap}
+              onChange={(e) => setSeqGap(Math.max(0, Number(e.target.value)))}
+              style={{ background: '#0d1525', border: '1px solid #334', borderRadius: 3,
+                color: '#eee', padding: '3px 6px', fontSize: 12 }} />
+          </label>
+
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 2, fontSize: 12, marginBottom: 6 }}>
+            <span style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span>IMU change threshold (°)</span>
+              <span style={{ color: '#aaa' }}>{seqImuThreshold}</span>
+            </span>
+            <input type="number" min={1} max={90} step={0.5} value={seqImuThreshold}
+              onChange={(e) => setSeqImuThreshold(Math.max(0.5, Number(e.target.value)))}
+              style={{ background: '#0d1525', border: '1px solid #334', borderRadius: 3,
+                color: '#eee', padding: '3px 6px', fontSize: 12 }} />
+          </label>
+
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 2, fontSize: 12, marginBottom: 8 }}>
+            <span style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span>Settle after position change (s)</span>
+              <span style={{ color: '#aaa' }}>{seqSettle}</span>
+            </span>
+            <input type="number" min={0} max={30} step={1} value={seqSettle}
+              onChange={(e) => setSeqSettle(Math.max(0, Number(e.target.value)))}
+              style={{ background: '#0d1525', border: '1px solid #334', borderRadius: 3,
+                color: '#eee', padding: '3px 6px', fontSize: 12 }} />
+          </label>
+
+          {seqActive && (
+            <div style={{
+              background: '#0a2e1e', border: '1px solid #227755', borderRadius: 4,
+              padding: '5px 8px', fontSize: 11, color: '#66ffaa', marginBottom: 8,
+            }}>
+              Sequential recording active — {clipDuration}s clips, {seqGap}s gap, IMU ±{seqImuThreshold}°
+            </div>
+          )}
+
+          {!seqActive ? (
+            <button onClick={handleStartSequential} disabled={busy}
+              style={{ ...btnPrimary, background: '#1e6644' }}>
+              Start sequential (all cams)
+            </button>
+          ) : (
+            <button onClick={handleStopSequential} disabled={busy}
+              style={{ ...btnPrimary, background: '#883333' }}>
+              Stop sequential
             </button>
           )}
         </div>

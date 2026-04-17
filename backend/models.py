@@ -14,6 +14,7 @@ class RecordingMode(str, Enum):
     video = "video"
     interval = "interval"
     scheduled = "scheduled"     # fixed-duration clips at a repeating interval
+    sequential = "sequential"   # cameras take turns; IMU-gated between cycles
 
 
 class StereoMode(str, Enum):
@@ -79,6 +80,10 @@ class RecordingStartRequest(BaseModel):
     # Scheduled mode: record clip_duration_seconds every clip_interval_seconds
     clip_duration_seconds: float = 5.0   # length of each clip
     clip_interval_seconds: float = 80.0  # total cycle time (clip + idle)
+    # Sequential mode: cameras record in turn, then wait for IMU position change
+    inter_camera_gap_seconds: float = 5.0     # pause between cameras
+    imu_change_threshold_deg: float = 5.0     # roll delta signalling a new position
+    imu_settle_seconds: float = 3.0           # pause after detecting position change
 
 
 class InferenceModeRequest(BaseModel):
