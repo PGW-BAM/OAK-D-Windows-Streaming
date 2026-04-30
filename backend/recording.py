@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from .config import settings
 from .models import RecordingMode
@@ -103,25 +103,30 @@ class VideoRecorder:
 
     def __init__(self, camera_id: str, fps: int = 20, output_dir: Path | None = None,
                  prefix: str = "", suffix: str = "",
-                 metadata_provider: MetadataProvider | None = None) -> None:
+                 metadata_provider: MetadataProvider | None = None,
+                 filename_override: str | None = None) -> None:
         self.camera_id = camera_id
         self.fps = fps
         self._output_dir = output_dir
         self._prefix = prefix
         self._suffix = suffix
+        self._filename_override = filename_override
         self._metadata_provider = metadata_provider
         self._container = None
         self._stream = None
         self._active = False
         self._path: Optional[Path] = None
         self._sidecar_path: Optional[Path] = None
-        self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=120)
+        # Items are (jpeg_bytes, capture_ts_s | None, seq_num | None) or None as stop sentinel.
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=120)
         self._mux_thread: Optional[threading.Thread] = None
 
     def start(self) -> Path:
         import av
         out_dir = _recordings_dir(self.camera_id, self._output_dir)
-        fname = _ts_filename(self.camera_id, "mp4", prefix=self._prefix, suffix=self._suffix)
+        fname = self._filename_override or _ts_filename(
+            self.camera_id, "mp4", prefix=self._prefix, suffix=self._suffix
+        )
         self._path = out_dir / fname
         self._container = av.open(str(self._path), mode="w")
         self._stream = self._container.add_stream("mjpeg", rate=self.fps)
@@ -160,48 +165,114 @@ class VideoRecorder:
         logger.info("Video recording started: %s", self._path)
         return self._path
 
-    def feed(self, jpeg_bytes: bytes) -> None:
-        """Non-blocking: drops the frame if the mux queue is full."""
+    def feed(
+        self,
+        jpeg_bytes: bytes,
+        *,
+        capture_ts_s: float | None = None,
+        seq_num: int | None = None,
+    ) -> None:
+        """Non-blocking: drops the frame if the mux queue is full.
+
+        ``capture_ts_s`` and ``seq_num`` come from the DepthAI packet metadata
+        so the muxer can build accurate PTS and skip duplicates.
+        """
         if not self._active:
             return
         try:
-            self._queue.put_nowait(jpeg_bytes)
+            self._queue.put_nowait((jpeg_bytes, capture_ts_s, seq_num))
         except queue.Full:
             logger.debug("Mux queue full for %s — frame dropped", self.camera_id)
 
     def _mux_loop(self) -> None:
         """Drain the queue and write frames to the MP4 container.
 
-        PTS is assigned from the monotonic clock (ms since first frame) so the
-        MP4 reflects real elapsed time — critical when the camera delivers
-        frames at a rate different from the configured ``fps``.
+        PTS uses the device's frame timestamp (when the camera actually
+        captured the frame) — not host wall-clock dequeue time, which can
+        collapse to identical milliseconds when the muxer wakes up to a queue
+        with multiple buffered frames and produces "stuck" videos in strict
+        MP4 players.
+
+        Each muxed packet has an explicit ``duration`` set retroactively from
+        the next frame's PTS (one-frame look-ahead). MP4 / QuickTime players
+        rely on the per-packet duration to know how long to display a frame;
+        leaving it at zero is the dominant cause of frozen-after-0.5s videos.
         """
         import av
         time_base = Fraction(1, 1000)
+        first_ts_s: float | None = None
         start_monotonic: float | None = None
         last_pts = -1
+        last_seq: int | None = None
+        # One-frame look-ahead: the previously-received packet is held back
+        # until the next packet's PTS is known, then muxed with an explicit
+        # ``duration`` derived from the gap.
+        pending: tuple[Any, int] | None = None  # (av.Packet, pts)
+        default_frame_ms = max(1, int(round(1000 / max(1, self.fps))))
+
+        def mux_pending(next_pts: int | None) -> None:
+            nonlocal pending
+            if pending is None:
+                return
+            packet, pts = pending
+            duration = (
+                next_pts - pts
+                if next_pts is not None and next_pts > pts
+                else default_frame_ms
+            )
+            try:
+                packet.duration = duration
+                self._container.mux(packet)
+            except Exception as exc:
+                logger.warning("Video mux error for %s: %s", self.camera_id, exc)
+            pending = None
+
         while True:
             item = self._queue.get()
             if item is None:  # stop sentinel
+                mux_pending(None)
                 break
             try:
-                now = time.monotonic()
-                if start_monotonic is None:
-                    start_monotonic = now
-                    pts = 0
+                jpeg_bytes, capture_ts_s, seq_num = item
+
+                # Skip duplicates / out-of-order packets emitted by the
+                # encoder under load — common cause of "same frame repeated"
+                # in the muxed output.
+                if (
+                    seq_num is not None
+                    and last_seq is not None
+                    and seq_num <= last_seq
+                ):
+                    continue
+                if seq_num is not None:
+                    last_seq = seq_num
+
+                # Pick PTS source: device timestamp if available, else host
+                # monotonic dequeue time as fallback.
+                if capture_ts_s is not None:
+                    if first_ts_s is None:
+                        first_ts_s = capture_ts_s
+                    pts = int((capture_ts_s - first_ts_s) * 1000)
                 else:
+                    now = time.monotonic()
+                    if start_monotonic is None:
+                        start_monotonic = now
                     pts = int((now - start_monotonic) * 1000)
                 # PTS must be strictly monotonic for MP4; bump if the clock
                 # didn't tick (sub-millisecond back-to-back frames)
                 if pts <= last_pts:
                     pts = last_pts + 1
                 last_pts = pts
-                packet = av.Packet(item)
+
+                packet = av.Packet(jpeg_bytes)
                 packet.stream = self._stream
                 packet.pts = pts
                 packet.dts = pts
                 packet.time_base = time_base
-                self._container.mux(packet)
+                # Mux the previous packet now that we know its real duration,
+                # then hold the new packet pending for the next iteration.
+                mux_pending(pts)
+                pending = (packet, pts)
             except Exception as exc:
                 logger.warning("Video mux error for %s: %s", self.camera_id, exc)
 
@@ -279,15 +350,15 @@ class IntervalRecorder:
         )
         return self._out_dir
 
-    def feed(self, jpeg_bytes: bytes) -> None:
+    def feed(self, jpeg_bytes: bytes, **_: object) -> None:
         with self._frame_lock:
             self._latest_frame = jpeg_bytes
 
-    def feed_left(self, jpeg_bytes: bytes) -> None:
+    def feed_left(self, jpeg_bytes: bytes, **_: object) -> None:
         with self._frame_lock:
             self._latest_left = jpeg_bytes
 
-    def feed_right(self, jpeg_bytes: bytes) -> None:
+    def feed_right(self, jpeg_bytes: bytes, **_: object) -> None:
         with self._frame_lock:
             self._latest_right = jpeg_bytes
 
@@ -416,19 +487,25 @@ class ScheduledVideoRecorder:
         )
         return self._out_dir
 
-    def feed(self, jpeg_bytes: bytes) -> None:
+    def feed(
+        self,
+        jpeg_bytes: bytes,
+        *,
+        capture_ts_s: float | None = None,
+        seq_num: int | None = None,
+    ) -> None:
         with self._lock:
             rec = self._current_main
         if rec:
-            rec.feed(jpeg_bytes)
+            rec.feed(jpeg_bytes, capture_ts_s=capture_ts_s, seq_num=seq_num)
 
-    def feed_left(self, jpeg_bytes: bytes) -> None:
+    def feed_left(self, jpeg_bytes: bytes, **_: object) -> None:
         with self._lock:
             rec = self._current_left
         if rec:
             rec.feed(jpeg_bytes)
 
-    def feed_right(self, jpeg_bytes: bytes) -> None:
+    def feed_right(self, jpeg_bytes: bytes, **_: object) -> None:
         with self._lock:
             rec = self._current_right
         if rec:
@@ -771,15 +848,25 @@ class RecordingWorker:
             )
             return self._interval.start()
 
-    def feed(self, jpeg_bytes: bytes) -> None:
+    def feed(
+        self,
+        jpeg_bytes: bytes,
+        *,
+        capture_ts_s: float | None = None,
+        seq_num: int | None = None,
+    ) -> None:
         if self._video:
-            self._video.feed(jpeg_bytes)
+            self._video.feed(
+                jpeg_bytes, capture_ts_s=capture_ts_s, seq_num=seq_num,
+            )
         if self._interval:
             self._interval.feed(jpeg_bytes)
         if self._scheduled:
-            self._scheduled.feed(jpeg_bytes)
+            self._scheduled.feed(
+                jpeg_bytes, capture_ts_s=capture_ts_s, seq_num=seq_num,
+            )
 
-    def feed_left(self, jpeg_bytes: bytes) -> None:
+    def feed_left(self, jpeg_bytes: bytes, **_: object) -> None:
         if self._video_left:
             self._video_left.feed(jpeg_bytes)
         if self._interval:
@@ -787,7 +874,7 @@ class RecordingWorker:
         if self._scheduled:
             self._scheduled.feed_left(jpeg_bytes)
 
-    def feed_right(self, jpeg_bytes: bytes) -> None:
+    def feed_right(self, jpeg_bytes: bytes, **_: object) -> None:
         if self._video_right:
             self._video_right.feed(jpeg_bytes)
         if self._interval:

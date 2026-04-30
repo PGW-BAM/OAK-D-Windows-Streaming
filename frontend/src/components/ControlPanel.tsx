@@ -4,6 +4,7 @@ import {
   applyControlAll,
   applyNearestCalibration,
   deleteCalibrationPoint,
+  getCameraAutoValues,
   getRecordingsDir,
   saveCalibrationPoint,
   setCalibrationAutoApply,
@@ -207,6 +208,62 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
       onRefresh()
     } catch { flash('Error applying stream settings') }
     finally { setBusy(false) }
+  }
+
+  // --- Auto-mode toggle handlers ---
+  // When the user unchecks an auto mode, snapshot the live sensor-reported
+  // auto-converged value into the manual fields and immediately apply it so
+  // the camera locks at that value. Lets the user briefly enable auto, let
+  // it converge, then uncheck — and the values stay where auto left them.
+  async function handleToggleAutoFocus(checked: boolean) {
+    setAutoFocus(checked)
+    if (checked) return
+    const live = await getCameraAutoValues(camera.id)
+    const lockedFocus = live?.manual_focus
+    if (lockedFocus == null) return
+    setManualFocus(lockedFocus)
+    try {
+      await applyControl(camera.id, {
+        auto_focus: false,
+        manual_focus: lockedFocus,
+      })
+      flash(`Focus locked at ${lockedFocus}`)
+    } catch { /* ignore */ }
+  }
+
+  async function handleToggleAutoExposure(checked: boolean) {
+    setAutoExposure(checked)
+    if (checked) return
+    const live = await getCameraAutoValues(camera.id)
+    const lockedExp = live?.exposure_us
+    const lockedIso = live?.iso
+    if (lockedExp == null || lockedIso == null) return
+    setExposureUs(lockedExp)
+    setIso(lockedIso)
+    try {
+      await applyControl(camera.id, {
+        auto_exposure: false,
+        exposure_us: lockedExp,
+        iso: lockedIso,
+      })
+      flash(`Exposure locked at ${lockedExp} µs / ISO ${lockedIso}`)
+    } catch { /* ignore */ }
+  }
+
+  async function handleToggleAutoWb(checked: boolean) {
+    setAutoWb(checked)
+    if (checked) return
+    const live = await getCameraAutoValues(camera.id)
+    const lockedWb = live?.white_balance_k
+    if (lockedWb == null) return
+    setWbK(lockedWb)
+    try {
+      await applyControl(camera.id, {
+        auto_white_balance: false,
+        white_balance_k: lockedWb,
+      })
+      flash(`White balance locked at ${lockedWb} K`)
+    } catch { /* ignore */ }
   }
 
   // --- Camera control ---
@@ -433,6 +490,7 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
   async function handleStartSequential() {
     setBusy(true)
     try {
+      const customDir = outputDir !== defaultDir ? outputDir : undefined
       const result = await startRecordingAll(
         'sequential',
         5,
@@ -589,7 +647,7 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
       <section style={sectionStyle}>
         <h4 style={headingStyle}>Exposure</h4>
         <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-          <input type="checkbox" checked={autoExposure} onChange={(e) => setAutoExposure(e.target.checked)} />
+          <input type="checkbox" checked={autoExposure} onChange={(e) => handleToggleAutoExposure(e.target.checked)} />
           Auto exposure
         </label>
         {!autoExposure && (
@@ -604,7 +662,7 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
       <section style={sectionStyle}>
         <h4 style={headingStyle}>Focus</h4>
         <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-          <input type="checkbox" checked={autoFocus} onChange={(e) => setAutoFocus(e.target.checked)} />
+          <input type="checkbox" checked={autoFocus} onChange={(e) => handleToggleAutoFocus(e.target.checked)} />
           Auto focus
         </label>
         {!autoFocus && (
@@ -772,7 +830,7 @@ export function ControlPanel({ camera, allCameras, onClose, onRefresh }: Props) 
       <section style={sectionStyle}>
         <h4 style={headingStyle}>White Balance</h4>
         <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-          <input type="checkbox" checked={autoWb} onChange={(e) => setAutoWb(e.target.checked)} />
+          <input type="checkbox" checked={autoWb} onChange={(e) => handleToggleAutoWb(e.target.checked)} />
           Auto white balance
         </label>
         {!autoWb && (

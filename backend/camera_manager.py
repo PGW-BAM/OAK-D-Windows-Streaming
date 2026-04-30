@@ -125,6 +125,11 @@ class CameraWorker:
         self._stop_event = threading.Event()
         self._connected = False
 
+        # Set the first time a frame reaches frame_buffer after each pipeline
+        # (re)build. Lets external orchestrators wait for "pipeline rebuilt and
+        # producing frames" instead of guessing with sleeps.
+        self._first_frame_event = threading.Event()
+
         # Camera state
         self._inference_mode = InferenceMode.none
         self._recording = False
@@ -161,6 +166,13 @@ class CameraWorker:
         # OAK-D defaults back to continuous autofocus on every restart.
         self._last_control: Optional[CameraControlRequest] = None
 
+        # Live auto-resolved values reported on each frame's metadata. Lets the
+        # UI snapshot the auto-converged values when the user toggles auto off.
+        self._live_lens_position: Optional[int] = None
+        self._live_exposure_us: Optional[int] = None
+        self._live_iso: Optional[int] = None
+        self._live_color_temp_k: Optional[int] = None
+
         # Host-side YOLO (lazy import)
         self._host_model = None
         self._host_model_path: Optional[str] = None
@@ -180,19 +192,29 @@ class CameraWorker:
         self._thread.start()
 
     def stop(self) -> None:
+        """Block until the worker thread has fully released the device.
+
+        Returning while the thread is still alive lets ``start()`` open a
+        second ``dai.Device`` handle to the same physical OAK-D. The two
+        sessions race inside DeviceGate; the loser triggers
+        ``dai::DeviceBase::~DeviceBase`` → ``terminate()`` → ``abort()``,
+        which crashes the entire backend process. So we wait — however
+        long it takes — for the worker to finish ``pipeline.stop()`` and
+        ``device.close()``. Progress is logged in 10 s chunks so a stuck
+        teardown is visible in the log.
+        """
         self._stop_event.set()
         if self._thread:
-            # High-bandwidth pipelines (4K+60fps) can take several seconds to
-            # wind down cleanly via pipeline.stop() / device.close().  5 s was
-            # too short and left the device open when the next camera tried to
-            # start.  30 s is a safe upper bound.
-            self._thread.join(timeout=30)
-            if self._thread.is_alive():
-                logger.warning(
-                    "Camera %s worker thread did not stop within 30 s "
-                    "— device may still be open",
-                    self.id,
-                )
+            waited = 0
+            while self._thread.is_alive():
+                self._thread.join(timeout=10)
+                waited += 10
+                if self._thread.is_alive():
+                    logger.warning(
+                        "Camera %s worker still tearing down after %ds — "
+                        "waiting (do not interrupt)",
+                        self.id[:8], waited,
+                    )
         self._connected = False
 
     def _build_pipeline(self, device: dai.Device) -> dai.Pipeline:
@@ -206,21 +228,51 @@ class CameraWorker:
         if need_main:
             cam = pipeline.create(dai.node.Camera)
             cam.build(dai.CameraBoardSocket.CAM_A)
+            if self._flip_180:
+                # On-device 180° rotation. Doing this on the host
+                # (cv2.imdecode → rotate → imencode) costs ~100-150 ms per
+                # 4K frame, which collapses recording fps to ~7 and produces
+                # 1-2 s clips out of a 5 s window. Pushing it to the ISP is
+                # essentially free.
+                try:
+                    cam.setImageOrientation(dai.CameraImageOrientation.ROTATE_180_DEG)
+                except Exception as exc:
+                    logger.warning(
+                        "Camera %s: setImageOrientation failed (%s) — "
+                        "falling back to host-side rotation",
+                        self.id[:8], exc,
+                    )
 
             encoder = pipeline.create(dai.node.VideoEncoder)
             encoder.setDefaultProfilePreset(
                 fps, dai.VideoEncoderProperties.Profile.MJPEG
             )
             encoder.setQuality(quality)
+            # Bump the device-side frame pool so the encoder always has a
+            # free buffer ready when a new camera frame arrives. With the
+            # default (4) at 4K/29 or 1080p/59 the encoder can stall briefly,
+            # producing duplicate output packets that show up as "stuck"
+            # frames in the recording.
+            try:
+                encoder.setNumFramesPool(8)
+            except AttributeError:
+                pass  # older DepthAI versions
             cam_output = cam.requestOutput(
                 size=res,
                 type=dai.ImgFrame.Type.NV12,
                 fps=fps,
             )
+            # On-device link only — the NV12 raw frame is consumed by the
+            # encoder inside the camera; the host receives only the MJPEG
+            # bitstream so PoE bandwidth scales with quality, not raw size.
             cam_output.link(encoder.input)
 
             self._mjpeg_queue = encoder.bitstream.createOutputQueue()
-            self._mjpeg_queue.setMaxSize(2)
+            # Larger host queue + non-blocking: lets the encoder keep
+            # producing without back-pressuring the device pipeline. If the
+            # host falls behind, oldest frames are dropped on the host side
+            # rather than stalling the camera/encoder.
+            self._mjpeg_queue.setMaxSize(30)
             self._mjpeg_queue.setBlocking(False)
 
             self._control_input = cam.inputControl.createInputQueue()
@@ -250,11 +302,20 @@ class CameraWorker:
                 # Left camera (CAM_B)
                 left_cam = pipeline.create(dai.node.Camera)
                 left_cam.build(dai.CameraBoardSocket.CAM_B)
+                if self._flip_180:
+                    try:
+                        left_cam.setImageOrientation(dai.CameraImageOrientation.ROTATE_180_DEG)
+                    except Exception:
+                        pass
                 left_encoder = pipeline.create(dai.node.VideoEncoder)
                 left_encoder.setDefaultProfilePreset(
                     fps, dai.VideoEncoderProperties.Profile.MJPEG
                 )
                 left_encoder.setQuality(quality)
+                try:
+                    left_encoder.setNumFramesPool(8)
+                except AttributeError:
+                    pass
                 left_output = left_cam.requestOutput(
                     size=STEREO_RESOLUTION,
                     type=dai.ImgFrame.Type.NV12,
@@ -262,17 +323,26 @@ class CameraWorker:
                 )
                 left_output.link(left_encoder.input)
                 self._left_mjpeg_queue = left_encoder.bitstream.createOutputQueue()
-                self._left_mjpeg_queue.setMaxSize(2)
+                self._left_mjpeg_queue.setMaxSize(30)
                 self._left_mjpeg_queue.setBlocking(False)
 
                 # Right camera (CAM_C)
                 right_cam = pipeline.create(dai.node.Camera)
                 right_cam.build(dai.CameraBoardSocket.CAM_C)
+                if self._flip_180:
+                    try:
+                        right_cam.setImageOrientation(dai.CameraImageOrientation.ROTATE_180_DEG)
+                    except Exception:
+                        pass
                 right_encoder = pipeline.create(dai.node.VideoEncoder)
                 right_encoder.setDefaultProfilePreset(
                     fps, dai.VideoEncoderProperties.Profile.MJPEG
                 )
                 right_encoder.setQuality(quality)
+                try:
+                    right_encoder.setNumFramesPool(8)
+                except AttributeError:
+                    pass
                 right_output = right_cam.requestOutput(
                     size=STEREO_RESOLUTION,
                     type=dai.ImgFrame.Type.NV12,
@@ -280,7 +350,7 @@ class CameraWorker:
                 )
                 right_output.link(right_encoder.input)
                 self._right_mjpeg_queue = right_encoder.bitstream.createOutputQueue()
-                self._right_mjpeg_queue.setMaxSize(2)
+                self._right_mjpeg_queue.setMaxSize(30)
                 self._right_mjpeg_queue.setBlocking(False)
 
                 logger.info("Stereo cameras enabled for %s", self.id)
@@ -330,6 +400,7 @@ class CameraWorker:
             self._frame_width = 0
             self._frame_height = 0
             self._fps_counter = 0
+            self._first_frame_event.clear()
 
             try:
                 device = dai.Device(self.device_info)
@@ -389,15 +460,33 @@ class CameraWorker:
             finally:
                 self._connected = False
                 if pipeline:
+                    t0 = time.monotonic()
                     try:
                         pipeline.stop()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "Camera %s pipeline.stop() raised: %s",
+                            self.id[:8], exc,
+                        )
+                    dt = time.monotonic() - t0
+                    logger.info(
+                        "Camera %s pipeline.stop() took %.2fs",
+                        self.id[:8], dt,
+                    )
                 if device:
+                    t0 = time.monotonic()
                     try:
                         device.close()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "Camera %s device.close() raised: %s",
+                            self.id[:8], exc,
+                        )
+                    dt = time.monotonic() - t0
+                    logger.info(
+                        "Camera %s device.close() took %.2fs",
+                        self.id[:8], dt,
+                    )
                 self._device = None
 
             # Interruptible delay before next attempt
@@ -416,23 +505,32 @@ class CameraWorker:
                 return
             data = bytes(pkt.getData())
 
-            # Rotate 180° for ceiling-mounted cameras
-            if self._flip_180:
-                try:
-                    import cv2
-                    arr = np.frombuffer(data, dtype=np.uint8)
-                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    if img is not None:
-                        img = cv2.rotate(img, cv2.ROTATE_180)
-                        _, buf = cv2.imencode(
-                            '.jpg', img,
-                            [cv2.IMWRITE_JPEG_QUALITY, self._mjpeg_quality],
-                        )
-                        data = buf.tobytes()
-                except Exception as exc:
-                    logger.debug("Rotation error on %s: %s", self.id, exc)
+            # Capture sensor metadata so the UI can snapshot the
+            # auto-converged values when the user toggles an auto mode off.
+            try:
+                lens = pkt.getLensPosition()
+                if isinstance(lens, int) and lens >= 0:
+                    self._live_lens_position = lens
+                exp = pkt.getExposureTime()
+                exp_us = int(exp.total_seconds() * 1_000_000) if exp else 0
+                if exp_us > 0:
+                    self._live_exposure_us = exp_us
+                iso = pkt.getSensitivity()
+                if isinstance(iso, int) and iso > 0:
+                    self._live_iso = iso
+                ct = pkt.getColorTemperature()
+                if isinstance(ct, int) and ct > 0:
+                    self._live_color_temp_k = ct
+            except Exception:
+                pass
+
+            # Rotation for ceiling-mounted cameras is now performed on the
+            # device's ISP (see _build_pipeline / setImageOrientation), so
+            # the host receives already-oriented frames at full fps.
 
             self.frame_buffer.put(data)
+            if not self._first_frame_event.is_set():
+                self._first_frame_event.set()
 
             # Detect frame dimensions once from JPEG header
             if self._frame_width == 0 and len(data) > 4:
@@ -470,7 +568,23 @@ class CameraWorker:
 
             # Feed recording worker (main camera)
             if self.recording_worker and self._recording:
-                self.recording_worker.feed(data)
+                # Pass through device timestamp + sequence number so the muxer
+                # can assign accurate, monotonically-increasing PTS based on
+                # capture time — not host dequeue time. Avoids "stuck" videos
+                # caused by burst dequeues collapsing PTS into the same ms.
+                ts_s: float | None = None
+                seq: int | None = None
+                try:
+                    ts = pkt.getTimestampDevice()
+                    if ts is not None:
+                        ts_s = ts.total_seconds()
+                except Exception:
+                    pass
+                try:
+                    seq = int(pkt.getSequenceNum())
+                except Exception:
+                    pass
+                self.recording_worker.feed(data, capture_ts_s=ts_s, seq_num=seq)
 
         except Exception as exc:
             logger.debug("Frame processing error on %s: %s", self.id, exc)
@@ -489,21 +603,8 @@ class CameraWorker:
                     continue
                 data = bytes(pkt.getData())
 
-                # Rotate 180° for ceiling-mounted cameras
-                if self._flip_180:
-                    try:
-                        import cv2
-                        arr = np.frombuffer(data, dtype=np.uint8)
-                        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                        if img is not None:
-                            img = cv2.rotate(img, cv2.ROTATE_180)
-                            _, enc = cv2.imencode(
-                                '.jpg', img,
-                                [cv2.IMWRITE_JPEG_QUALITY, self._mjpeg_quality],
-                            )
-                            data = enc.tobytes()
-                    except Exception as exc:
-                        logger.debug("Stereo rotation error on %s/%s: %s", self.id, side, exc)
+                # Stereo rotation is also handled on-device via
+                # setImageOrientation; see _build_pipeline.
 
                 buf.put(data)
                 # Feed stereo to recording worker
@@ -648,6 +749,20 @@ class CameraWorker:
             raise RuntimeError("No frame available yet")
         return data
 
+    def get_live_auto_values(self) -> dict[str, int | None]:
+        """Return the most recent sensor-reported auto values.
+
+        These are populated from each incoming frame's camera metadata, so
+        they reflect what the auto modes (AE/AF/AWB) have converged to.
+        Useful for snapshotting the values when the user toggles auto off.
+        """
+        return {
+            "manual_focus": self._live_lens_position,
+            "exposure_us": self._live_exposure_us,
+            "iso": self._live_iso,
+            "white_balance_k": self._live_color_temp_k,
+        }
+
     def capture_stereo_snapshot(self, side: str) -> bytes:
         """Return the latest stereo JPEG frame bytes ('left' or 'right')."""
         buf = self.left_frame_buffer if side == "left" else self.right_frame_buffer
@@ -659,6 +774,13 @@ class CameraWorker:
     # ------------------------------------------------------------------
     # Stream settings (requires pipeline rebuild)
     # ------------------------------------------------------------------
+
+    def wait_for_ready(self, timeout_s: float = 15.0) -> bool:
+        """Block until the worker produces its first frame after a (re)build.
+
+        Returns True on success, False on timeout.
+        """
+        return self._first_frame_event.wait(timeout_s)
 
     def update_stream_settings(self, req: StreamSettingsRequest) -> None:
         """Update per-camera stream settings and restart the pipeline if needed."""
@@ -677,11 +799,13 @@ class CameraWorker:
             self._stereo_mode = req.stereo_mode
             changed = True
 
-        # flip_180 is post-processing only — no pipeline restart needed
+        # flip_180 is now handled on-device (cam.setImageOrientation), so a
+        # change requires a pipeline rebuild to apply.
         if req.flip_180 is not None and req.flip_180 != self._flip_180:
             self._flip_180 = req.flip_180
+            changed = True
             logger.info(
-                "Camera %s flip_180 set to %s",
+                "Camera %s flip_180 set to %s — pipeline restart required",
                 self.id, self._flip_180,
             )
 

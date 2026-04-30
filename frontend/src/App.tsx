@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { CameraGrid } from './components/CameraGrid'
+import { KreuzstossButton } from './components/KreuzstossButton'
+import { KreuzstossPanel } from './components/KreuzstossPanel'
+import { KreuzstossProvider } from './contexts/KreuzstossContext'
 import {
   applySessionToCameras,
   getLastSession,
@@ -10,6 +13,14 @@ import {
 import './App.css'
 
 export default function App() {
+  return (
+    <KreuzstossProvider>
+      <AppInner />
+    </KreuzstossProvider>
+  )
+}
+
+function AppInner() {
   const { cameras, loading, discover, refresh } = useCameraList(3000)
   const [discovering, setDiscovering] = useState(false)
   const [pendingSession, setPendingSession] = useState<SessionSnapshot | null>(null)
@@ -94,11 +105,12 @@ export default function App() {
         <span style={{ color: '#666', fontSize: 12 }}>
           {cameras.filter((c) => c.connected).length}/{cameras.length} connected
         </span>
+        <KreuzstossButton cameraCount={cameras.length} mode="full" />
+        <KreuzstossButton cameraCount={cameras.length} mode="simple" />
         <button
           onClick={handleDiscover}
           disabled={discovering}
           style={{
-            marginLeft: 'auto',
             padding: '6px 14px',
             background: discovering ? '#333' : '#334',
             border: '1px solid #555',
@@ -112,6 +124,7 @@ export default function App() {
           {discovering ? 'Scanning\u2026' : '+ Discover cameras'}
         </button>
       </header>
+      <KreuzstossPanel cameraCount={cameras.length} />
 
       {/* Restore-last-session modal */}
       {pendingSession && (

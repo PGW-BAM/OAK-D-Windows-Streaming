@@ -1,0 +1,23 @@
+{
+  "saved_at": "2026-04-30T05:06:31.911Z",
+  "cameras": [
+    {
+      "id": "74926132",
+      "stream_fps": 29,
+      "mjpeg_quality": 85,
+      "resolution": "1080p",
+      "stereo_mode": "main_only",
+      "flip_180": true,
+      "inference_mode": "none"
+    },
+    {
+      "id": "2702998576",
+      "stream_fps": 29,
+      "mjpeg_quality": 85,
+      "resolution": "4k",
+      "stereo_mode": "main_only",
+      "flip_180": true,
+      "inference_mode": "none"
+    }
+  ]
+}

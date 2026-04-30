@@ -54,6 +54,19 @@ from .recording import (
     cleanup_old_recordings,
     get_storage_stats,
 )
+from .kreuzstoss import (
+    DEFAULT_INTERVAL_SECONDS as KREUZ_DEFAULT_INTERVAL,
+    MIN_INTERVAL_SECONDS as KREUZ_MIN_INTERVAL,
+    KreuzstossConfig,
+    KreuzstossRunner,
+    KreuzstossStatus,
+    resolve_save_dir as resolve_kreuzstoss_save_dir,
+)
+from .kreuzstoss_store import (
+    DEFAULT_SAVE_DIR as KREUZ_DEFAULT_SAVE_DIR,
+    load_kreuzstoss_config,
+    save_kreuzstoss_config,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,6 +81,11 @@ logger = logging.getLogger(__name__)
 camera_manager = CameraManager()
 recording_workers: dict[str, RecordingWorker] = {}
 sequential_recorder: SequentialRecorder | None = None
+
+# Kreuzstoss programm (looping bandwidth-safe dual-camera sequence)
+_kreuzstoss_runner: KreuzstossRunner | None = None
+_kreuzstoss_task: asyncio.Task | None = None
+_kreuzstoss_lock = asyncio.Lock()
 
 # Calibration store (loaded at startup)
 CALIBRATION_PATH = Path(__file__).parent.parent / "config" / "calibration.json"
@@ -258,11 +276,17 @@ FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 @app.get("/", include_in_schema=False)
 async def root() -> HTMLResponse:
     index = FRONTEND_DIST / "index.html"
+    no_cache = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
     if index.exists():
-        return HTMLResponse(index.read_text())
+        return HTMLResponse(index.read_text(encoding="utf-8"), headers=no_cache)
     return HTMLResponse(
         "<h1>OAK-D Dashboard backend running</h1>"
-        "<p>No frontend build found. Run <code>npm run build</code> in ./frontend</p>"
+        "<p>No frontend build found. Run <code>npm run build</code> in ./frontend</p>",
+        headers=no_cache,
     )
 
 
@@ -433,6 +457,20 @@ async def camera_control_all(req: CameraControlRequest) -> ApiResponse:
     if errors:
         return ApiResponse(ok=False, message=f"Partial failure: {'; '.join(errors)}")
     return ApiResponse(ok=True, message="Control applied to all cameras")
+
+
+@app.get("/api/camera/{camera_id}/auto-values", response_model=ApiResponse)
+async def get_camera_auto_values(camera_id: str) -> ApiResponse:
+    """Return the camera's most recent sensor-reported auto-converged values.
+
+    Used by the UI so that when the user toggles an auto mode off, the manual
+    fields can snap to the values the camera was actually using.
+    """
+    try:
+        worker = camera_manager.get_worker(camera_id)
+    except KeyError:
+        raise HTTPException(404, f"Camera {camera_id!r} not found")
+    return ApiResponse(ok=True, message="ok", data=worker.get_live_auto_values())
 
 
 # ---------------------------------------------------------------------------
@@ -1060,6 +1098,184 @@ async def set_recordings_dir(body: dict) -> ApiResponse:
         raise HTTPException(400, f"Cannot create directory: {exc}")
     settings.recordings_dir = p
     return ApiResponse(ok=True, message=f"Recordings directory set to {p}")
+
+
+# ---------------------------------------------------------------------------
+# Kreuzstoss programm — looping bandwidth-safe dual-camera sequence
+# ---------------------------------------------------------------------------
+
+def _idle_kreuzstoss_status() -> KreuzstossStatus:
+    cfg = load_kreuzstoss_config()
+    save_dir = Path(cfg.get("save_dir", KREUZ_DEFAULT_SAVE_DIR))
+    free_gb: float | None
+    try:
+        import shutil as _shutil
+        free_gb = _shutil.disk_usage(save_dir).free / (1024 ** 3) if save_dir.exists() else None
+    except OSError:
+        free_gb = None
+    return KreuzstossStatus(
+        running=False,
+        cycle_index=0,
+        step_index=0,
+        current_step="idle",
+        phase="idle",
+        save_dir=str(save_dir),
+        interval_seconds=float(cfg.get("interval_seconds", KREUZ_DEFAULT_INTERVAL)),
+        free_space_gb=free_gb,
+    )
+
+
+@app.get("/api/kreuzstoss/config", response_model=ApiResponse)
+async def kreuzstoss_get_config() -> ApiResponse:
+    cfg = load_kreuzstoss_config()
+    return ApiResponse(
+        ok=True,
+        message="ok",
+        data={
+            "save_dir": cfg.get("save_dir", KREUZ_DEFAULT_SAVE_DIR),
+            "interval_seconds": float(cfg.get("interval_seconds", KREUZ_DEFAULT_INTERVAL)),
+            "min_interval_seconds": KREUZ_MIN_INTERVAL,
+        },
+    )
+
+
+@app.post("/api/kreuzstoss/config", response_model=ApiResponse)
+async def kreuzstoss_set_config(body: dict) -> ApiResponse:
+    save_dir = body.get("save_dir")
+    interval = body.get("interval_seconds")
+    payload: dict[str, Any] = {}
+    if isinstance(save_dir, str) and save_dir.strip():
+        payload["save_dir"] = save_dir.strip()
+    if interval is not None:
+        try:
+            iv = float(interval)
+        except (TypeError, ValueError):
+            raise HTTPException(422, "interval_seconds must be a number")
+        if iv < KREUZ_MIN_INTERVAL:
+            raise HTTPException(
+                422,
+                f"interval_seconds must be >= {KREUZ_MIN_INTERVAL}",
+            )
+        payload["interval_seconds"] = iv
+    if not payload:
+        raise HTTPException(422, "save_dir or interval_seconds required")
+    cfg = save_kreuzstoss_config(payload)
+    return ApiResponse(ok=True, message="Kreuzstoss config saved", data=cfg)
+
+
+async def _kreuzstoss_start_impl(
+    body: dict, mode: str, fallback_subdir: str,
+) -> ApiResponse:
+    """Shared start logic for the full and simple Kreuzstoss modes."""
+    global _kreuzstoss_runner, _kreuzstoss_task
+    async with _kreuzstoss_lock:
+        if _kreuzstoss_runner is not None:
+            raise HTTPException(409, "Kreuzstoss is already running")
+
+        workers = camera_manager.all_workers()
+        if len(workers) < 2:
+            raise HTTPException(
+                412,
+                f"Kreuzstoss requires 2 cameras; found {len(workers)}",
+            )
+
+        stored = load_kreuzstoss_config()
+        save_dir_str = body.get("save_dir") or stored.get(
+            "save_dir", KREUZ_DEFAULT_SAVE_DIR,
+        )
+        interval_in = body.get("interval_seconds", stored.get(
+            "interval_seconds", KREUZ_DEFAULT_INTERVAL,
+        ))
+        try:
+            interval = float(interval_in)
+        except (TypeError, ValueError):
+            raise HTTPException(422, "interval_seconds must be a number")
+        if interval < KREUZ_MIN_INTERVAL:
+            raise HTTPException(
+                422,
+                f"interval_seconds must be >= {KREUZ_MIN_INTERVAL}",
+            )
+
+        fallback = settings.recordings_dir / fallback_subdir
+        try:
+            resolved = resolve_kreuzstoss_save_dir(Path(save_dir_str), fallback)
+        except RuntimeError as exc:
+            raise HTTPException(500, str(exc))
+
+        cfg = KreuzstossConfig(
+            save_dir=resolved,
+            prefix=resolved.name or fallback_subdir,
+            interval_seconds=interval,
+            mode=mode,
+        )
+
+        runner = KreuzstossRunner(
+            camera_manager,
+            cfg,
+            metadata_provider_factory=_make_metadata_provider,
+        )
+        _kreuzstoss_runner = runner
+
+        async def _run_and_clear() -> None:
+            global _kreuzstoss_runner, _kreuzstoss_task
+            try:
+                await runner.run()
+            finally:
+                _kreuzstoss_runner = None
+                _kreuzstoss_task = None
+
+        _kreuzstoss_task = asyncio.create_task(_run_and_clear())
+
+    return ApiResponse(
+        ok=True,
+        message=f"Kreuzstoss ({mode}) started",
+        data={
+            "save_dir": str(resolved),
+            "interval_seconds": interval,
+            "mode": mode,
+        },
+    )
+
+
+@app.post("/api/kreuzstoss/start", response_model=ApiResponse)
+async def kreuzstoss_start(body: dict | None = None) -> ApiResponse:
+    return await _kreuzstoss_start_impl(
+        body or {}, mode="full", fallback_subdir="kreuzstoss",
+    )
+
+
+@app.post("/api/kreuzstoss_simple/start", response_model=ApiResponse)
+async def kreuzstoss_simple_start(body: dict | None = None) -> ApiResponse:
+    return await _kreuzstoss_start_impl(
+        body or {}, mode="simple", fallback_subdir="kreuzstoss_simple",
+    )
+
+
+@app.post("/api/kreuzstoss/stop", response_model=ApiResponse)
+async def kreuzstoss_stop() -> ApiResponse:
+    runner = _kreuzstoss_runner
+    task = _kreuzstoss_task
+    if runner is None or task is None:
+        raise HTTPException(409, "Kreuzstoss is not running")
+    runner.request_stop()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=60)
+    except asyncio.TimeoutError:
+        return ApiResponse(
+            ok=False,
+            message="Stop signalled, restore still in progress",
+        )
+    return ApiResponse(
+        ok=True, message="Kreuzstoss stopped and settings restored",
+    )
+
+
+@app.get("/api/kreuzstoss/status", response_model=KreuzstossStatus)
+async def kreuzstoss_status() -> KreuzstossStatus:
+    runner = _kreuzstoss_runner
+    if runner is None:
+        return _idle_kreuzstoss_status()
+    return runner.status()
 
 
 # ---------------------------------------------------------------------------

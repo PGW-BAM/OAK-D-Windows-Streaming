@@ -117,6 +117,24 @@ export async function applyControl(cameraId: string, control: Record<string, unk
   return res.json()
 }
 
+export interface CameraAutoValues {
+  manual_focus: number | null
+  exposure_us: number | null
+  iso: number | null
+  white_balance_k: number | null
+}
+
+export async function getCameraAutoValues(cameraId: string): Promise<CameraAutoValues | null> {
+  try {
+    const res = await fetch(`${API}/camera/${cameraId}/auto-values`)
+    if (!res.ok) return null
+    const body = await res.json()
+    return (body?.data ?? null) as CameraAutoValues | null
+  } catch {
+    return null
+  }
+}
+
 export async function setStreamSettings(cameraId: string, settings: StreamSettingsRequest) {
   const res = await fetch(`${API}/camera/${cameraId}/stream-settings`, {
     method: 'POST',
@@ -499,4 +517,141 @@ export async function checkBandwidth(
     }),
   })
   return res.json()
+}
+
+// ---------------------------------------------------------------------------
+// Kreuzstoss programm
+// ---------------------------------------------------------------------------
+
+export type KreuzstossPhase =
+  | 'idle'
+  | 'cam1_active'
+  | 'cam2_active'
+  | 'interval'
+  | 'restoring'
+  | 'error'
+  | 'done'
+  | 'stopped'
+
+export type KreuzstossMode = 'full' | 'simple'
+
+export interface KreuzstossStatus {
+  running: boolean
+  cycle_index: number
+  step_index: number
+  total_steps: number
+  current_step: string
+  phase: KreuzstossPhase
+  mode: KreuzstossMode
+  started_at: string | null
+  cycle_started_at: string | null
+  interval_remaining_s: number | null
+  save_dir: string
+  interval_seconds: number
+  free_space_gb: number | null
+  error: string | null
+  last_artifact: string | null
+  artifacts_total: number
+}
+
+export interface KreuzstossConfig {
+  save_dir: string
+  interval_seconds: number
+  min_interval_seconds: number
+}
+
+export async function getKreuzstossConfig(): Promise<KreuzstossConfig> {
+  const fallback: KreuzstossConfig = {
+    save_dir: 'D:\\Kreuzstöße\\P02',
+    interval_seconds: 5,
+    min_interval_seconds: 5,
+  }
+  try {
+    const res = await fetch(`${API}/kreuzstoss/config`)
+    if (!res.ok) return fallback
+    const body = await res.json()
+    return (body?.data as KreuzstossConfig) ?? fallback
+  } catch {
+    return fallback
+  }
+}
+
+export async function setKreuzstossConfig(
+  payload: { save_dir?: string; interval_seconds?: number },
+): Promise<KreuzstossConfig> {
+  const res = await fetch(`${API}/kreuzstoss/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(body?.detail ?? body?.message ?? res.statusText)
+  }
+  const body = await res.json()
+  return body.data as KreuzstossConfig
+}
+
+export async function startKreuzstoss(
+  saveDir?: string,
+  intervalSeconds?: number,
+  mode: KreuzstossMode = 'full',
+): Promise<ApiResponse> {
+  const path = mode === 'simple' ? 'kreuzstoss_simple/start' : 'kreuzstoss/start'
+  const res = await fetch(`${API}/${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      save_dir: saveDir ?? null,
+      interval_seconds: intervalSeconds ?? null,
+    }),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(body?.detail ?? body?.message ?? res.statusText)
+  }
+  return res.json()
+}
+
+export async function stopKreuzstoss(): Promise<ApiResponse> {
+  const res = await fetch(`${API}/kreuzstoss/stop`, { method: 'POST' })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(body?.detail ?? body?.message ?? res.statusText)
+  }
+  return res.json()
+}
+
+export async function fetchKreuzstossStatus(): Promise<KreuzstossStatus | null> {
+  try {
+    const res = await fetch(`${API}/kreuzstoss/status`)
+    if (!res.ok) return null
+    return (await res.json()) as KreuzstossStatus
+  } catch {
+    return null
+  }
+}
+
+export function useKreuzstossStatus(
+  pollMs = 500,
+  enabled = true,
+): KreuzstossStatus | null {
+  const [status, setStatus] = useState<KreuzstossStatus | null>(null)
+
+  useEffect(() => {
+    if (!enabled) return
+    let cancelled = false
+    const tick = async () => {
+      const s = await fetchKreuzstossStatus()
+      if (!cancelled) setStatus(s)
+    }
+    tick()
+    const id = setInterval(tick, pollMs)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [pollMs, enabled])
+
+  return status
 }

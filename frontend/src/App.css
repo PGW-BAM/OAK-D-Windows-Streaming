@@ -29,3 +29,23 @@ body {
 .react-resizable-handle:hover {
   opacity: 1;
 }
+
+/* Kreuzstoss programm button — large pulsing call to action */
+@keyframes kreuzstoss-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 200, 80, 0.7); }
+  50%      { box-shadow: 0 0 0 14px rgba(255, 200, 80, 0); }
+}
+
+.kreuzstoss-btn.idle:not(:disabled) {
+  animation: kreuzstoss-pulse 2s ease-in-out infinite;
+}
+
+.kreuzstoss-btn.running {
+  animation: none;
+}
+
+.kreuzstoss-btn:disabled {
+  opacity: 0.4;
+  animation: none;
+  cursor: not-allowed;
+}
