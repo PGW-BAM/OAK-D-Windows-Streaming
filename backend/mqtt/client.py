@@ -108,7 +108,9 @@ class MqttClient:
             self._mqtt_loop,
         )
         try:
-            future.result(timeout=5.0)
+            # Await without blocking the calling event loop (FastAPI): future.result()
+            # here used to freeze the whole app for up to 5 s whenever the broker stalled.
+            await asyncio.wait_for(asyncio.wrap_future(future), timeout=5.0)
         except Exception as exc:
             logger.error("MQTT publish error on %s: %s", topic, exc)
 
