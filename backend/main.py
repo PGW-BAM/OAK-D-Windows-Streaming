@@ -1027,7 +1027,7 @@ async def capture_angle_target(req: CaptureAngleTargetRequest) -> AngleTargetRes
         raise HTTPException(503, "MQTT service not running — cannot read drive position")
 
     positions = mqtt_service.get_drive_positions(req.cam_id)
-    motor_position = positions.get("b")
+    motor_position = positions.get("drive_b")
     if motor_position is None:
         raise HTTPException(
             503,
