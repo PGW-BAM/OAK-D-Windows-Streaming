@@ -68,6 +68,11 @@ class SequenceRunner:
         # Drive position tracking (updated by monitor subscriptions)
         self._drive_positions: dict[str, DrivePosition] = {}
         self._position_events: dict[str, asyncio.Event] = {}
+        # Per waiting axis: expected sequence_id, whether this command's move has been seen
+        # (a MOVING status, or any earlier status for it), and a fault reason if any.
+        self._position_expect: dict[str, str] = {}
+        self._position_armed: dict[str, bool] = {}
+        self._position_fault: dict[str, str] = {}
 
         # Task handle for the sequence loop
         self._task: asyncio.Task | None = None
@@ -95,9 +100,30 @@ class SequenceRunner:
             key = f"{cam_id}:{pos.drive_axis}"
             self._drive_positions[key] = pos
 
-            # Signal waiters if drive reached target
-            if pos.state == "reached" and key in self._position_events:
-                self._position_events[key].set()
+            # Signal waiters. A "reached" only counts once this command's move has started:
+            # the Pi used to republish the PREVIOUS move's "reached" before moving, and a
+            # retained replay can carry an old one too. Accept "reached" if a "moving"
+            # status, or any earlier status for this command, was already seen.
+            event = self._position_events.get(key)
+            if event is None or event.is_set():
+                return
+            expected = self._position_expect.get(key)
+            if expected is not None and pos.sequence_id != expected:
+                return
+            if pos.state == "fault":
+                self._position_fault[key] = "drive reported fault"
+                event.set()
+            elif pos.state == "reached" and self._position_armed.get(key):
+                event.set()
+            else:
+                self._position_armed[key] = True
+
+    def _clear_position_waiters(self, *keys: str) -> None:
+        for key in keys:
+            self._position_events.pop(key, None)
+            self._position_expect.pop(key, None)
+            self._position_armed.pop(key, None)
+            self._position_fault.pop(key, None)
 
     def get_drive_positions(self, cam_id: str) -> dict[str, float | None]:
         """Return the latest cached drive positions for a camera (non-blocking)."""
@@ -231,8 +257,11 @@ class SequenceRunner:
 
         axis_a_key = f"{cam_id}:a"
         axis_b_key = f"{cam_id}:b"
-        self._position_events[axis_a_key] = asyncio.Event()
-        self._position_events[axis_b_key] = asyncio.Event()
+        for key in (axis_a_key, axis_b_key):
+            self._position_events[key] = asyncio.Event()
+            self._position_expect[key] = seq_id
+            self._position_armed[key] = False
+            self._position_fault.pop(key, None)
 
         move_a = MoveCommand(
             sequence_id=seq_id,
@@ -282,6 +311,7 @@ class SequenceRunner:
             )
         except asyncio.TimeoutError:
             # Send stop and report error
+            self._clear_position_waiters(axis_a_key, axis_b_key)
             await self._mqtt.publish(
                 Topics.cmd_stop(cam_id),
                 StopCommand(sequence_id=seq_id),
@@ -291,6 +321,20 @@ class SequenceRunner:
                 f"Drive move timeout after {timeout}s",
             )
             raise RuntimeError(f"Drive move timeout for {cam_id}")
+
+        faults = {k: self._position_fault[k] for k in (axis_a_key, axis_b_key)
+                  if k in self._position_fault}
+        if faults:
+            # Do not capture at an unknown position: abort the step like a timeout.
+            self._clear_position_waiters(axis_a_key, axis_b_key)
+            await self._mqtt.publish(
+                Topics.cmd_stop(cam_id),
+                StopCommand(sequence_id=seq_id),
+            )
+            await self._publish_error(
+                "drive_fault", seq_id, cam_id, f"Drive fault: {sorted(faults)}",
+            )
+            raise RuntimeError(f"Drive fault for {cam_id}: {sorted(faults)}")
 
         # --- Settling delay ---
         self.state = OrchestratorState.SETTLING
@@ -320,8 +364,7 @@ class SequenceRunner:
                 )
 
         # Clean up events
-        self._position_events.pop(axis_a_key, None)
-        self._position_events.pop(axis_b_key, None)
+        self._clear_position_waiters(axis_a_key, axis_b_key)
 
     async def _do_capture(
         self, cam_id: str, seq_id: str, step: CaptureStep
